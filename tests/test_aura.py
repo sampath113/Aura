@@ -1511,16 +1511,45 @@ class AndroidMirrorTests(unittest.TestCase):
         self.assertIn("@Field List<String> supportedPython", script)
         # read by the prepareAuraEngine closure -> def, and handed to the method
         self.assertIn("def engineBinary = ", script)
-        self.assertIn("void stripEngine(File outDir, List<String> names, String binaryName)", script)
-        self.assertIn("stripEngine(outDir, new ArrayList<String>(wanted.values()), engineBinary)",
+        self.assertIn("void stripEngine(def log, File outDir, List<String> names, String binaryName)",
                       script)
-        # read by the engine methods -> @Field, because `logger` inside a method is
-        # the same trap as `engineBinary` inside a closure
-        self.assertIn("@Field def auraLog = logger", script)
+        self.assertIn("stripEngine(logger, outDir, new ArrayList<String>(wanted.values()), engineBinary)",
+                      script)
+        # and the logger the methods write to arrives the same way, for the same
+        # reason (a method cannot see a script-level `def`)
+        self.assertIn("boolean tryStrip(def log, File tool, File file)", script)
+        self.assertIn("File fetchEngineArchive(def log, File rawDir, String archiveName,", script)
+        self.assertIn("fetchEngineArchive(logger, rawDir, engineArchiveName, engineMirrors,", script)
         for name in ("fetchEngineArchive", "stripEngine", "tryStrip"):
             body = self.method_body(script, name)
-            self.assertIn("auraLog.", body, name)
+            self.assertIn("log.", body, name)
             self.assertNotIn("logger.", body, name)
+
+    def test_no_script_field_initializer_reads_a_script_property(self):
+        """A field initializer runs in the script class's *constructor*, before
+        Gradle has wired the script's dynamic lookup - so `@Field def x = logger`
+        does not fail where it is used, it fails while the project is being
+        configured, and it takes the rest of the script with it:
+
+            A problem occurred configuring project ':app'.
+            > Could not create an instance of type build_<hash>.
+               > Cannot invoke ...DynamicLookupRoutine.property(...) because
+                 "this.dynamicLookupRoutine" is null
+            > compileSdkVersion is not specified. Please add it to build.gradle
+
+        (That last line is the tell: `android { }` never ran.) A 25-second
+        Android build died this way on 2026-09-23, so every `@Field` here holds a
+        literal or nothing, and anything that has to be looked up - the logger -
+        is passed to the methods that need it."""
+        script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
+        fields = [line.strip() for line in script.splitlines() if line.strip().startswith("@Field")]
+        self.assertTrue(fields, "expected at least supportedPython to be an @Field")
+        for line in fields:
+            for forbidden in ("logger", "project", "layout", "rootProject", "System."):
+                self.assertNotIn(forbidden, line, line)
+        # the pattern may (and does) appear in the comment explaining it - what
+        # matters is that no @Field *declaration* uses it
+        self.assertNotIn("@Field def auraLog", "\n".join(fields))
 
     @staticmethod
     def method_body(script: str, name: str) -> str:

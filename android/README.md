@@ -79,7 +79,7 @@ What the build does, in order:
    inside it; the log prints each APK's size and whether it is in there.
 6. **Everything else** is `MainActivity.java` and three small Java files.
 
-### Two traps in `app/build.gradle`
+### Three traps in `app/build.gradle`
 
 * **Groovy scopes a script-level value *two* opposite ways, and both ways of getting
   it wrong are run-time surprises, not compile errors.** Each of them brought down
@@ -95,9 +95,35 @@ What the build does, in order:
   both need is passed to the method as a parameter. In this file `engineBinary` is a
   `def` (the `prepareAuraEngine` closure reads it, and it is passed into
   `stripEngine`), `supportedPython` is an `@Field` (only `detectBuildPython`
-  reads it), and **`auraLog` is an `@Field`** because the engine methods log
-  (`auraLog.lifecycle`, never a bare `logger` - a method's bare `logger` is exactly
-  the thing this rule is about). The failure messages are
+  reads it), and **the logger is passed in as a parameter too** (`stripEngine(def
+  log, ...)`, `tryStrip(def log, ...)`, `fetchEngineArchive(def log, ...)`, called
+  with `logger` from the closure) — because the obvious way to give the methods a
+  logger, `@Field def auraLog = logger`, is a third trap of its own:
+
+  | written as | initializer may read `logger`/`project`/`layout`? |
+  |---|---|
+  | `def x = logger` (script level) | yes |
+  | `@Field def x = logger` | **no** — see below |
+
+  A field initializer runs in the script class's **constructor**, before Gradle has
+  wired the script's dynamic lookup, so the build dies while *configuring*, with
+  an error that points somewhere else entirely (the real one, from the build
+  server on 2026-09-23):
+
+  ```
+  * What went wrong:
+  A problem occurred configuring project ':app'.
+  > Could not create an instance of type build_5e5gdr7l7ehyyzvatyi09hfwc.
+     > Cannot invoke ...DynamicLookupRoutine.property(...) because
+       "this.dynamicLookupRoutine" is null
+  > compileSdkVersion is not specified. Please add it to build.gradle
+  ```
+
+  `android { }` never ran, which is what the last line is really saying. Every
+  `@Field` in this file therefore holds a literal or nothing, and
+  `test_no_script_field_initializer_reads_a_script_property` enforces it.
+
+  The failure messages for the other two traps are
 
   ```
   Could not get unknown property 'supportedPython' for project ':app'          # script evaluation

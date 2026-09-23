@@ -29,14 +29,25 @@ plugins {
     id 'com.chaquo.python'
 }
 
-// The log the *methods* below write to.
+// The log the engine *methods* write to is handed to them as a parameter: the
+// two call sites are inside the prepareAuraEngine closure, where `logger`
+// resolves.
 //
-// A method cannot see a script-level `def` (see the note on engineBinary), so
-// anything a method needs has to be an `@Field` - the second of the two scoping
-// rules this file has already been bitten by. `logger` resolves fine inside
-// closures, but the engine code that reports sizes and failures is in methods,
-// so there is exactly one logger and it lives here.
-@Field def auraLog = logger
+// It cannot be an `@Field`. A field initializer runs in the script class's
+// constructor, before Gradle has wired the script's dynamic lookup, so
+// `@Field def auraLog = logger` does not fail where it is used - it fails while
+// the project is being *configured*:
+//
+//   A problem occurred configuring project ':app'.
+//   > Could not create an instance of type build_5e5gdr7l7ehyyzvatyi09hfwc.
+//      > Cannot invoke ...DynamicLookupRoutine.property(...) because
+//        "this.dynamicLookupRoutine" is null
+//   > compileSdkVersion is not specified. Please add it to build.gradle
+//
+// That last line is the tell: the android { } block never ran, so the script is
+// dead while the error talks about something else entirely. Every `@Field` in
+// this file therefore holds a literal or nothing at all, and a test refuses to
+// let one mention `logger`, `project` or `layout` again.
 
 // ---------------------------------------------------------------------------
 // The model engine
@@ -343,7 +354,7 @@ String sha256Of(File file) {
  *  every reason attached - a build log that says why is worth a lot more than
  *  one that says "could not prepare the engine".
  */
-File fetchEngineArchive(File rawDir, String archiveName, List<String> urls,
+File fetchEngineArchive(def log, File rawDir, String archiveName, List<String> urls,
                         long expectedBytes, String expectedSha256, File target) {
     rawDir.mkdirs()
     def problems = new ArrayList<String>()
@@ -352,7 +363,7 @@ File fetchEngineArchive(File rawDir, String archiveName, List<String> urls,
             def part = new File(rawDir, archiveName + ".part")
             part.delete()
             try {
-                auraLog.lifecycle("AURA: fetching the model engine from ${url} (attempt ${attempt})")
+                log.lifecycle("AURA: fetching the model engine from ${url} (attempt ${attempt})")
                 def connection = new URL(url).openConnection()
                 connection.connectTimeout = 30000
                 connection.readTimeout = 180000
@@ -388,7 +399,7 @@ File fetchEngineArchive(File rawDir, String archiveName, List<String> urls,
                 problems << "${url}: the finished download could not be kept"
                 continue
             }
-            auraLog.lifecycle("AURA: the model engine archive arrived whole (${humanSize(bytes)})")
+            log.lifecycle("AURA: the model engine archive arrived whole (${humanSize(bytes)})")
             return target
         }
     }
@@ -454,14 +465,14 @@ List<File> stripTools() {
     return found
 }
 
-boolean tryStrip(File tool, File file) {
+boolean tryStrip(def log, File tool, File file) {
     try {
         def process = new ProcessBuilder(tool.absolutePath, "--strip-unneeded", file.absolutePath)
                 .redirectErrorStream(true).start()
         def text = process.inputStream.text
         def code = process.waitFor()
         if (code != 0) {
-            auraLog.lifecycle("AURA: ${tool.name} could not strip ${file.name}: ${text.trim()}")
+            log.lifecycle("AURA: ${tool.name} could not strip ${file.name}: ${text.trim()}")
         }
         return code == 0 && file.length() > 0L
     } catch (Exception ignored) {
@@ -477,12 +488,12 @@ boolean tryStrip(File tool, File file) {
  *  Nothing here is worth failing a build over (the engine runs either way, it is
  *  only bigger), so every step works on a copy and is abandoned quietly if it
  *  does not work. */
-void stripEngine(File outDir, List<String> names, String binaryName) {
+void stripEngine(def log, File outDir, List<String> names, String binaryName) {
     def tools = stripTools()
     def sizeOf = { List<String> list -> list.inject(0L) { total, name -> total + new File(outDir, name).length() } }
     long before = sizeOf(names)
     if (tools.isEmpty()) {
-        auraLog.warn("AURA: no ELF strip tool on this machine (looked on PATH and in every NDK) - the "
+        log.warn("AURA: no ELF strip tool on this machine (looked on PATH and in every NDK) - the "
                 + "engine keeps its debug information and the APK will be about ${humanSize(before)} "
                 + "bigger than it needs to be. On a Debian-style build machine: apt-get install -y binutils")
         return
@@ -494,12 +505,12 @@ void stripEngine(File outDir, List<String> names, String binaryName) {
         }
         def probe = new File(outDir, binaryName + ".probe")
         probe.bytes = binary.bytes
-        if (!tryStrip(tool, probe)) {
+        if (!tryStrip(log, tool, probe)) {
             probe.delete()
             continue
         }
         probe.delete()
-        auraLog.lifecycle("AURA: stripping the engine (${humanSize(before)}) with ${tool}")
+        log.lifecycle("AURA: stripping the engine (${humanSize(before)}) with ${tool}")
         names.each { name ->
             def target = new File(outDir, name)
             if (!target.isFile()) {
@@ -507,7 +518,7 @@ void stripEngine(File outDir, List<String> names, String binaryName) {
             }
             def copy = new File(outDir, name + ".unstripped")
             copy.bytes = target.bytes
-            if (tryStrip(tool, copy)) {
+            if (tryStrip(log, tool, copy)) {
                 target.delete()
                 if (!copy.renameTo(target)) {
                     copy.delete()
@@ -517,10 +528,10 @@ void stripEngine(File outDir, List<String> names, String binaryName) {
             }
         }
         long after = sizeOf(names)
-        auraLog.lifecycle("AURA: the engine is ${humanSize(after)} (was ${humanSize(before)})")
+        log.lifecycle("AURA: the engine is ${humanSize(after)} (was ${humanSize(before)})")
         return
     }
-    auraLog.warn("AURA: none of the strip tools on this machine could strip the engine - it keeps "
+    log.warn("AURA: none of the strip tools on this machine could strip the engine - it keeps "
             + "its debug information and the APK will be about ${humanSize(before)} bigger than it "
             + "needs to be")
 }
@@ -550,7 +561,7 @@ tasks.register("prepareAuraEngine") {
                 archive.delete()
             }
             if (!archive.isFile()) {
-                fetchEngineArchive(rawDir, engineArchiveName, engineMirrors,
+                fetchEngineArchive(logger, rawDir, engineArchiveName, engineMirrors,
                         engineArchiveBytes, engineArchiveSha256, archive)
             }
 
@@ -591,7 +602,7 @@ tasks.register("prepareAuraEngine") {
 
             // engineBinary is a script-level `def`, which stripEngine() - a
             // method - cannot see, so it is handed over explicitly.
-            stripEngine(outDir, new ArrayList<String>(wanted.values()), engineBinary)
+            stripEngine(logger, outDir, new ArrayList<String>(wanted.values()), engineBinary)
 
             stamp.parentFile.mkdirs()
             stamp.text = "${engineTag}\n"
@@ -643,7 +654,9 @@ tasks.named("preBuild") {
 // installed and then could not run a model".
 tasks.matching { it.name == "assembleRelease" || it.name == "assembleDebug" }.configureEach {
     doLast {
-        def apkRoot = layout.buildDirectory.dir("outputs/apk").get().asFile
+        // `project.` spelled out: a task action's delegate is the task, not the
+        // project, so being explicit here costs nothing and asks no questions.
+        def apkRoot = project.layout.buildDirectory.dir("outputs/apk").get().asFile
         def apks = []
         if (apkRoot.isDirectory()) {
             apkRoot.eachFileRecurse { file ->

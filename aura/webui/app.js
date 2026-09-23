@@ -251,7 +251,7 @@ function renderDocuments() {
   box.querySelectorAll(".docDel").forEach((button) => {
     button.onclick = async (event) => {
       const id = event.target.closest(".doc").dataset.id;
-      try { await api("GET", "/api/document/" + id); toast("Removed"); loadLibrary(); }
+      try { await api("POST", "/api/document/" + id); toast("Removed"); loadLibrary(); }
       catch (error) { toast(friendlyError(error), true); }
     };
   });
@@ -452,7 +452,6 @@ async function ask(question) {
     if (sources) pending.insertAdjacentHTML("beforeend", sources);
     wireCitations(pending);
     addAnswerActions(pending, payload);
-    state.answers.push(payload);
     state.answers.push(payload);
   } catch (error) {
     clearInterval(ticker);

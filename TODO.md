@@ -361,6 +361,10 @@ itself within six seconds, a sticky one is still there after six.
       install?" is answerable from the phone.
 - [x] **The one-line status** no longer says "local model problem" for a build that
       simply has no engine; it says "quoted answers only".
+- [x] **A dead control looks dead.** The old sheet only styled `button.primary:disabled`,
+      so the dead *ghost* buttons - the disabled model download, and the new "Needs the
+      model engine" - looked exactly like live ones. Found while bug-checking this
+      change; `style.css` now has a general `button:disabled` rule.
 
 ### The build (why an APK with no engine got installed at all)
 
@@ -386,8 +390,35 @@ that looked fine, installed fine, and could not run a model. Now:
       files `engineLibs`/`ENGINE_BUNDLE_FILES` name are inside it (they total
       242,869,928 bytes unstripped).
 
-**Tests:** 169 passing (was 164) - including the engine-archive integrity pins, the
-APK check, an error state always carrying a reason, and a half-bundled engine naming
-its missing file. The whole suite was run against Python 3.12.7 (in a wasm
-interpreter, since this workspace has no shell), and the interface changes were
-exercised against a real DOM by evaluating the actual `app.js` functions.
+**Tests:** 170 passing (was 169) - including the engine-archive integrity pins, the
+APK check, an error state always carrying a reason, a half-bundled engine naming
+its missing file, and the guard that a `GET /api/document/<id>` can never delete a
+document. The whole suite was run against Python 3.12.7 (in a wasm interpreter,
+since this workspace has no shell), and the interface changes were exercised
+against a real DOM by evaluating the actual `app.js` functions.
+
+### The build I broke, and what fixed it
+
+The first push of this round **failed the Android build at configuration time** -
+`assembleDebug`, dead in 25 seconds. The cause was mine, and it is worth writing
+down because the error names the wrong thing:
+
+```
+A problem occurred configuring project ':app'.
+> Could not create an instance of type build_5e5gdr7l7ehyyzvatyi09hfwc.
+   > Cannot invoke ...DynamicLookupRoutine.property(...) because
+     "this.dynamicLookupRoutine" is null
+> compileSdkVersion is not specified. Please add it to build.gradle
+```
+
+The `android { compileSdk 34 }` block never ran, which is what the last line really
+means. The culprit was `@Field def auraLog = logger`: a field initializer runs in
+the script class's **constructor**, before Gradle has wired the script's dynamic
+lookup, so `logger` could not resolve and the whole script class failed to
+instantiate. It was added as insurance against a *different* Groovy scoping trap
+(`logger` inside a method) and cost a build - the third of these traps now written
+down in `android/README.md`. The fix keeps the insurance without the hazard: the
+logger is **passed to the methods as a parameter** (`stripEngine(logger, ...)`),
+from the closure, where `logger` resolves. `@Field` is now only ever a literal, and
+`test_no_script_field_initializer_reads_a_script_property` fails if one ever
+mentions `logger`, `project` or `layout` again.

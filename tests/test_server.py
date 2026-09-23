@@ -175,8 +175,28 @@ class ServerTests(unittest.TestCase):
 
         status, _headers, body = self.get("/api/library")
         doc_id = json.loads(body)["documents"][0]["doc_id"]
-        status, _headers, body = self.get("/api/document/" + doc_id)
+        status, _headers, body = self.post("/api/document/" + doc_id, {})
         self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["removed"])
+        self.assertEqual(self.library.stats()["documents"], 0)
+
+    def test_a_get_can_never_delete_a_document(self):
+        """Removing a document is a POST. A GET that deletes is how a prefetch, a
+        reload or a pasted URL loses somebody's work - and the interface is not
+        the only thing that can reach this server, a browser is too."""
+        target = self.root / "notes.md"
+        target.write_text("# Title\n\nOsmosis moves water across a membrane.\n", encoding="utf-8")
+        status, _headers, body = self.post("/api/add", {"path": str(target)})
+        self.assertEqual(status, 200, body)
+        status, _headers, body = self.get("/api/library")
+        doc_id = json.loads(body)["documents"][0]["doc_id"]
+
+        status, _headers, body = self.get("/api/document/" + doc_id)
+        self.assertEqual(status, 405)
+        self.assertIn("never changes your library", body)
+        self.assertEqual(self.library.stats()["documents"], 1)
+
+        status, _headers, body = self.post("/api/document/" + doc_id, {})
         self.assertTrue(json.loads(body)["removed"])
         self.assertEqual(self.library.stats()["documents"], 0)
 

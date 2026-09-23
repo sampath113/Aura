@@ -330,6 +330,10 @@ column is not a grid at all.
   bubble on screen for ever - the "Reading <file>..." that was welded to the bottom of
   the window - because the next toast cleared its timeout before it fired. Nothing
   that leaves a stale message on screen is acceptable here.
+* **A control that cannot be pressed must look that way.** `button:disabled` is styled
+  once, at the top of the button rules, so a disabled *ghost* button (a model download
+  that has to wait for the engine, say) is visibly dead. Styling only `button.primary`
+  - which is what this used to do - is how a dead button ends up looking live.
 * **A kill does not reach the engine.** Android kills a backgrounded app, and
   `llama-server` survives it, so the next start reaps it (`_reap_orphans`) — and
   only it: another app's copy of the same binary, or any process that merely

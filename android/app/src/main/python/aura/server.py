@@ -550,8 +550,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(self.api.job(job_id))
                 return
             if route.startswith("/api/document/"):
-                doc_id = route.rsplit("/", 1)[-1]
-                self._send_json({"removed": bool(self.api.library.remove(doc_id))})
+                # A GET must never change the library. A prefetch, a reload, or a
+                # URL someone pastes into a browser would delete one of their
+                # documents, and "the interface only calls it on a click" is not a
+                # defence - the method is the contract. Removing a document is a
+                # POST; see do_POST.
+                self._send_json({"error": "a document is removed with POST /api/document/<id> - "
+                                         "a GET never changes your library"}, 405)
                 return
             if route.startswith("/assets/"):
                 relative = posixpath.normpath(route[len("/assets/"):]).lstrip("/")
@@ -614,6 +619,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if route == "/api/reingest":
                 self._send_json(self.api.reingest())
+                return
+            if route.startswith("/api/document/"):
+                # The one way to remove a document. A GET on the same path is
+                # refused (see do_GET): deleting user data must be something the
+                # user asked for, not something a browser decided to fetch.
+                doc_id = route.rsplit("/", 1)[-1]
+                self._send_json({"removed": bool(self.api.library.remove(doc_id))})
                 return
             if route == "/api/model/download":
                 self._send_json(self.api.model_download(self._decode_json(body).get("id", "")))
