@@ -32,7 +32,11 @@ WINDOW_TITLE = "{} - {}".format(config.APP_NAME, config.APP_TAGLINE)
 WINDOW_WIDTH = 1240
 WINDOW_HEIGHT = 820
 WINDOW_MIN = (960, 640)
-WINDOW_BG = "#0b1020"
+# The window is painted this colour before the page has drawn anything. It is the
+# interface's light background: the theme the page picks is light unless the
+# machine says otherwise, and a dark window flashing white is worse than a light
+# one flashing dark.
+WINDOW_BG = "#ffffff"
 
 SHELLS = ("webview", "app", "browser", "none")
 SHELL_LABELS = {

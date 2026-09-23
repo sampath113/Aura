@@ -54,7 +54,8 @@ aura/
   ingest.py             PDF, DOCX, text, Markdown, CSV/TSV, images
   store.py              the Library: persistence + orchestration
   server.py             local HTTP API + static UI host
-  webui/                the single-page interface (served by server.py)
+  webui/                the single-page interface (served by server.py):
+                        index.html, style.css, app.js, icon.png
 android/                the Android app - the same AURA, as an APK (Gradle project)
   README.md             how the phone build works, and what a device can do to it
   app/src/main/python/  a byte-identical copy of aura/, kept in step by tools/sync_aura.py
@@ -207,6 +208,45 @@ With a local model running (see *Giving AURA a model*) the same evidence is
 handed to it instead and the answer comes back as prose - the mode line then
 reads `written by your local model from your sources`, and every citation label
 the model invents is stripped before you see it.
+
+## The interface
+
+`aura/webui/` is one page, served by `server.py` on 127.0.0.1 and shown by both
+the desktop window and the Android WebView, so it is the whole of AURA's looks. It
+is deliberately the layout people already know from ChatGPT: a library down the
+left, one column of conversation down the middle, and a rounded box at the bottom
+to type into.
+
+* **The conversation is the page.** A question is a rounded block on the right; an
+  answer is plain text in the column, with nothing under it but the answer itself.
+  The answer mode, the number of passages and the passages themselves live in a
+  **Sources** box under the answer which starts **closed** - the reader asked a
+  question, not for a bibliography. Tapping a `[S1]` chip in the answer opens that
+  box and scrolls to the passage, which is what a citation has to do to be worth
+  showing. The mode is only spelled out there when it is *not* the ordinary "quoted
+  from your pages" case.
+* **The library is a column on a wide screen and a drawer on a phone**, opened by
+  the button in the top bar and closed by the one in its own header or by the
+  scrim. On a phone whose library is empty the drawer opens itself once, because
+  the alternative first screen is empty with no explanation of how to fill it.
+* **Light and dark.** The theme is decided by a few lines in `index.html`'s head
+  (before the first paint, so a dark phone never flashes white), kept in
+  `localStorage` under `aura.theme`, and offered in Settings as
+  Automatic / Light / Dark. It belongs to the screen, not to the library, so it is
+  never sent to the server.
+* **One column width** (`--thread`, 768px) is what makes it read as a conversation
+  rather than as a dashboard. The composer sits at the bottom of that column and
+  the send button is dead until there is something to send.
+
+**The bug this replaced is worth remembering, because this kind of layout fails
+silently.** The old layout was `grid-template-columns: 320px 1fr` with a `.solo`
+variant of `0 1fr` for when the library was hidden - and hiding the library also
+took it out of the grid, so the conversation became the *first* grid child and was
+placed in the **0px** column. On a phone that rendered the entire chat 1.6 pixels
+wide (it is the sliver down the left edge of the screenshot the user sent). Nothing
+about it was a JavaScript error, so no test noticed: **do not go back to hiding one
+grid item to make room for another.** The drawer is `position: fixed` and the
+column is not a grid at all.
 
 ## Recent fixes (do not regress these)
 

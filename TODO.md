@@ -133,9 +133,9 @@ window is now `aura/desktop.py`:
 
 ## 3. Queued from the user (2026-09-23, not built yet)
 
-- [ ] **Sources as a dropdown.** `sourcesHtml()` already renders a `<details>`,
-      but with the `open` attribute, so every passage is expanded. Make it start
-      closed and put the count in the summary ("Sources used by this answer (6)").
+- [x] **Sources as a dropdown - DONE (2026-09-23, see §6).** `sourcesHtml()` now
+      renders a closed `<details>` whose summary is the passage count, and the
+      citation chips open it.
 - [ ] **Longer answers.** Two causes: (a) the model the user picked is Qwen2.5
       **0.5B**, the weakest in the catalogue - the UI should nudge towards 1.5B+
       when there is enough RAM; (b) `GROUNDING_SYSTEM` rule 5 tells the model to
@@ -212,28 +212,37 @@ interface, the same model list - running on the device.
 - [x] **Tests** - 164 in the suite, including the Android paths, the bundled-engine
       report (present / half-copied / absent), the reap rules, the first-run defaults,
       `/api/host`, the models-folder validation, the build script's engine list, the
-      `@Field` rule below, and the mirror. See `android/README.md` for how to build it.
+      Groovy scoping rule below, and the mirror. See `android/README.md` for how to
+      build it.
 
-**The first build, and what it taught us (2026-09-23):** the user pushed the port to
-GitHub and ran the Android build. It failed after 47 s, before compiling anything:
+**The first two builds, and what they taught us (2026-09-23):**
 
-```
-A problem occurred evaluating project ':app'.
-> Could not get unknown property 'supportedPython' for project ':app'
-```
+* **Build 1** failed after 47 s, before compiling anything:
+  `A problem occurred evaluating project ':app'. > Could not get unknown property
+  'supportedPython' for project ':app'` - a *method* in a Groovy build script cannot
+  see a plain `def` declared at script level.
+* **Build 2** (release, commit `ef546ed`) **succeeded**: a signed
+  `aura-release-signed.apk`, apksigner-verified. Everything except the engine went in
+  correctly - the Python probe picked `/usr/bin/python3` (Python 3.13), Chaquopy
+  compiled the app, and all three pip packages arrived as arm64 wheels (`pypdf`
+  6.19.0, `python-docx` 1.2.0, `Pillow` 11.0.0, `lxml` 5.3.0). The APK is 15.5 MB
+  because the engine is **not** in it: `prepareAuraEngine` hit the mirror image of the
+  first bug - `Could not get unknown property 'engineBinary' for task
+  ':app:prepareAuraEngine'` - because a *closure* cannot see an `@Field`, only a plain
+  `def`. The try/catch around the engine step is the only reason the build finished
+  rather than failing.
 
-Cause: a **method** in a Groovy build script cannot see a plain `def` declared at
-script level - it is a local of the script's `run()`, not a property. So
-`detectBuildPython()` could not read `supportedPython` (and `stripEngine()` could not
-read `engineBinary`) - `engineBinary` had not failed *yet* only because that method is
-not called until the task runs. Fixed by making both `@Field`s
-(`import groovy.transform.Field`), widening the Python probe (3.9–3.13, trying
-`python3.13` down to `python3.9`, resolving an absolute path for Chaquopy), and adding
-`AURA_NO_PYTHON_PACKAGES=1` as a documented escape hatch for the pip step.
-`test_the_values_a_groovy_method_reads_are_fields` guards the rule now. Everything
-else in the build had already checked out: AGP 8.6.1 + Chaquopy 16.1.0 resolved from
-Maven Central, and the wheel indexes list arm64 `lxml`, `Pillow` and `pypdf` for
-3.9–3.13. The second build had not been run yet at the time of writing.
+The rule, and why it was easy to get wrong twice: `def` is visible to closures but not
+to methods, `@Field` is visible to methods but not to closures, and *neither* mistake
+is a compile error. So `engineBinary` is a `def` (read by the `prepareAuraEngine`
+closure, and passed into `stripEngine` as a parameter) and `supportedPython` is an
+`@Field` (read only by the method `detectBuildPython`).
+`test_script_values_reach_the_code_that_reads_them` guards both. The same round also
+widened the Python probe (3.9–3.13, `python3.13` down to `python3.9`, an absolute path
+handed to Chaquopy) and added `AURA_NO_PYTHON_PACKAGES=1` as a documented escape hatch
+for the pip step. **An APK that actually carries the engine has not been built yet** -
+that is the next run, and it is the one to watch the size of: expect roughly 40-60 MB
+with the stripped engine, against 15.5 MB without it.
 
 **Still open, and honest about it:**
 
@@ -261,3 +270,47 @@ Maven Central, and the wheel indexes list arm64 `lxml`, `Pillow` and `pypdf` for
       for one refresh. Re-read once after an ingest settles.
 - [x] Android was a client of the desktop engine; it is now the same app with the
       engine bundled into the APK (see section 4).
+
+## 6. The interface, rebuilt to feel like ChatGPT - **BUILT** (2026-09-23)
+
+**Requested, verbatim:**
+
+> yeah these things and also i dont like the ui at all... amke it look just like
+> chat gpt feel like chat gpt.. do the work of a 10x full stack debug debug debug
+> polish polishh.. both pc and android and also the sources listed shoudle be
+> hidden in the drop down by defalut and only the answe should be visible and
+> nothing else understood?
+
+The two screenshots attached to it were of the Android build: the chat column about
+forty pixels wide with the text wrapped a character or two per line, and the
+Settings sheet. The narrow column was the `.solo` grid bug described in
+`README.md` (*The interface*) - hiding the library took it out of a two-column grid
+and left the conversation in the 0px column.
+
+- [x] **The conversation is the page.** `webui/index.html` is now a sidebar, one top
+      bar, one centered column, one composer. A question is a rounded block on the
+      right; an answer is plain text with nothing under it.
+- [x] **Sources are closed by default**, and a `[S1]` chip opens the box and scrolls
+      to the passage (the box used to render `open`, and the chips did nothing
+      visible). The answer mode and the passage count moved into that summary, so
+      the only thing left under an answer is a warning, when there is one.
+- [x] **The phone layout is a drawer, not a stacked column**: the library slides in
+      over the conversation, the conversation gets the whole screen, and on a phone
+      with an empty library the drawer opens itself once.
+- [x] **Automatic / Light / Dark**, chosen in Settings, applied before the first
+      paint, and following the machine's own setting on Automatic.
+- [x] **Copy** on every answer, a composer that grows with the question and whose
+      send button is dead until there is something to send, focus rings for keyboard
+      use, and relevance scores hidden on narrow screens.
+- [x] **The old bug cannot come back**: no grid item is hidden to make room for
+      another, because that is what collapsed the conversation to 1.6 px.
+
+**Honest limits of this round.** The interface was verified by driving the real
+`index.html`/`style.css`/`app.js` in an isolated frame at 390x844 and 1280x860
+with the API stubbed, and by *measuring* element boxes - not on a phone, and not
+on the desktop window. Screenshot checking of this layout is unreliable: the
+capture path re-lays-out text with fallback font metrics, so spurious line breaks
+appear in it (chips that are one line measure 41px and are drawn wrapped). Trust
+`getBoundingClientRect` over the picture. Nothing in `aura/webui/` is covered by
+the Python tests - they check that the files are *served*, never what they look
+like - so a visual change needs to be looked at by hand.

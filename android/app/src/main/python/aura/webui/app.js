@@ -12,8 +12,34 @@ const state = {
   local: true,
   host: {},
   busy: false,
-  libraryHidden: false,
 };
+
+/* ------------------------------------------------------------------ the theme
+   Settings offers Auto / Light / Dark. The stored choice is applied by the tiny
+   script in index.html before the first paint (so a dark screen never flashes
+   white); these are the same decision, made again whenever it changes. */
+function currentTheme() {
+  try { return localStorage.getItem("aura.theme") || "auto"; } catch (error) { return "auto"; }
+}
+
+function applyTheme(choice) {
+  const follows = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  const dark = choice === "dark" || (choice === "auto" && follows);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute("content", dark ? "#212121" : "#ffffff");
+}
+
+function setTheme(choice) {
+  try { localStorage.setItem("aura.theme", choice); } catch (error) { /* private browsing */ }
+  applyTheme(choice);
+  document.querySelectorAll("#themeRow button").forEach((button) => {
+    button.classList.toggle("on", button.dataset.themeChoice === choice);
+  });
+}
+
+const isNarrow = () => Boolean(window.matchMedia && window.matchMedia("(max-width: 900px)").matches);
+
 
 const el = (id) => document.getElementById(id);
 
@@ -251,14 +277,10 @@ async function loadHealth() {
     : (state.model.state === "starting" ? " - local model loading"
       : (state.model.state === "error" ? " - local model problem" : ""));
   const where = state.host.android ? "on this phone" : (state.stats.root || "");
-  // Two sentences for two widths: a phone's header has room for the state of
-  // the model, not for the backend's whole description (which is in Settings,
-  // and in the pill that a narrow window hides). CSS picks one.
-  const brief = (modelBit ? modelBit.replace(/^ - /, "") : backend.replace(/\s*\(.*\)\s*$/, ""));
-  el("statusLine").innerHTML =
-    '<span class="wideOnly">' + escapeHtml(health.app + " " + health.version + " - " + backend +
-      modelBit + " - " + where) + "</span>" +
-    '<span class="narrowOnly">' + escapeHtml(brief + (where ? " - " + where : "")) + "</span>";
+  // One line, shortened by CSS where there is no room for it rather than by a
+  // second copy of the sentence here.
+  el("statusLine").textContent =
+    health.app + " " + health.version + " - " + backend + modelBit + (where ? " - " + where : "");
   renderHostNotice();
   renderStats();
 }
@@ -279,16 +301,23 @@ function modeLabel(mode) {
   return MODE_LABELS[key] || mode;
 }
 
+/* A question is a rounded block on the right, an answer is plain text in the
+   column - the one difference that makes a conversation readable at a glance.
+   The empty state goes as soon as there is something to read. */
 function addMessage(role, html, meta) {
   const empty = el("emptyState");
   if (empty) empty.remove();
   const node = document.createElement("div");
   node.className = "msg " + role;
-  node.innerHTML = '<div class="who">' + (role === "user" ? "You" : "AURA") + "</div>" +
-    '<div class="bubble">' + html + '</div><div class="meta">' + (meta || "") + "</div>";
-  el("chatScroll").appendChild(node);
-  el("chatScroll").scrollTop = el("chatScroll").scrollHeight;
+  node.innerHTML = '<div class="bubble">' + html + '</div><div class="meta">' + (meta || "") + "</div>";
+  el("thread").appendChild(node);
+  scrollToEnd();
   return node;
+}
+
+function scrollToEnd() {
+  const box = el("chatScroll");
+  if (box) box.scrollTop = box.scrollHeight;
 }
 
 function setBubble(node, html) {
@@ -301,7 +330,10 @@ function setMeta(node, html) {
   if (meta) meta.innerHTML = html || "";
 }
 
-function sourcesHtml(hits) {
+/* The passages an answer was drawn from. Closed by default: the answer is the
+   answer, and the sources are one tap away - the citation chips in the text
+   open this box rather than pointing at it. */
+function sourcesHtml(hits, mode) {
   if (!hits || !hits.length) return "";
   const items = hits.map((hit) => {
     const chunk = hit.chunk || {};
@@ -314,7 +346,13 @@ function sourcesHtml(hits) {
       "<span>score " + score + dense + "</span></div>" +
       '<div class="srcText">' + escapeHtml(chunk.text || "") + "</div></div>";
   }).join("");
-  return '<details class="sources" open><summary>Sources used by this answer</summary>' + items + "</details>";
+  const count = hits.length === 1 ? "1 source" : hits.length + " sources";
+  // A quoted answer is the normal case and needs no explanation; anything else
+  // is worth saying out loud - a written answer is the model's words rather
+  // than the page's, and the reader should know which one they are reading.
+  const tail = mode && mode !== "extractive" ? " &middot; " + escapeHtml(modeLabel(mode)) : "";
+  return '<details class="sources"><summary>' + count + tail + "</summary>" +
+    '<div class="srcList">' + items + "</div></details>";
 }
 
 async function ask(question) {
@@ -323,7 +361,7 @@ async function ask(question) {
   if (!question) { toast("Type a question first", true); return; }
   if (!state.docs.length) { toast("Add a document to your library first", true); return; }
   state.busy = true;
-  el("askBtn").disabled = true;
+  updateSend();
   addMessage("user", escapeHtml(question));
   const pending = addMessage("aura",
     '<span class="thinking"><span class="dot"></span><span class="dot"></span>' +
@@ -340,27 +378,19 @@ async function ask(question) {
     clearInterval(ticker);
     const checks = payload.checks || {};
     const mode = payload.mode || "extractive";
-    const metaBits = ["mode: " + modeLabel(mode),
-                      "citations: " + ((payload.citations || []).length)];
-    if (checks.coverage !== undefined && mode !== "extractive" && mode !== "closest"
-        && mode !== "outline") {
-      metaBits.push("citation coverage: " + Math.round(checks.coverage * 100) + "%");
-    }
+    // The mode and the passage count live in the sources box; underneath the
+    // answer only a real warning is shown, so what is left is the answer.
     const warnings = (checks.notes || [])
       .filter((note) => !(mode === "no-evidence" && /nothing matched/i.test(note)))
       .map((note) => '<span class="warn">' + escapeHtml(note) + "</span>");
     if (checks.fallback) warnings.unshift('<span class="warn">nearest passages, not a direct match</span>');
     setBubble(pending, renderRich(payload.text || ""));
-    setMeta(pending, metaBits.map(escapeHtml).join(" &middot; ") +
-      (warnings.length ? " &middot; " + warnings.join(" &middot; ") : ""));
-    const sources = sourcesHtml(payload.hits);
-    if (sources) {
-      const node = document.createElement("div");
-      node.className = "msg aura";
-      node.innerHTML = sources;
-      pending.appendChild(node);
-    }
+    setMeta(pending, warnings.join(" &middot; "));
+    const sources = sourcesHtml(payload.hits, mode);
+    if (sources) pending.insertAdjacentHTML("beforeend", sources);
     wireCitations(pending);
+    addAnswerActions(pending, payload);
+    state.answers.push(payload);
     state.answers.push(payload);
   } catch (error) {
     clearInterval(ticker);
@@ -368,21 +398,75 @@ async function ask(question) {
     setMeta(pending, "");
   } finally {
     state.busy = false;
-    el("askBtn").disabled = false;
-    el("chatScroll").scrollTop = el("chatScroll").scrollHeight;
+    scrollToEnd();
+    updateSend();
   }
 }
 
+/* Tapping a [S1] chip in the answer opens the sources box and brings that
+   passage into view - the alternative is a label that does nothing. */
 function wireCitations(scope) {
   scope.querySelectorAll(".cite").forEach((chip) => {
     chip.onclick = () => {
       const target = scope.querySelector('.src[data-label="' + chip.dataset.label + '"]');
       if (!target) return;
+      const box = target.closest("details");
+      if (box) box.open = true;
       target.classList.add("highlight");
       target.scrollIntoView({ behavior: "smooth", block: "center" });
-      setTimeout(() => target.classList.remove("highlight"), 2200);
+      setTimeout(() => target.classList.remove("highlight"), 2400);
     };
   });
+}
+
+/* An answer is something a student wants in their notes, so it can be copied
+   whole - the citations come with it, which is the point of them. */
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (error) { /* not allowed here; fall through to the old way */ }
+  try {
+    const box = document.createElement("textarea");
+    box.value = text;
+    box.setAttribute("readonly", "");
+    box.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+    document.body.appendChild(box);
+    box.select();
+    const copied = document.execCommand("copy");
+    box.remove();
+    return copied;
+  } catch (error) {
+    return false;
+  }
+}
+
+function addAnswerActions(node, payload) {
+  const text = String(payload.text || "").trim();
+  if (!text) return;
+  const row = document.createElement("div");
+  row.className = "msgActions";
+  const button = document.createElement("button");
+  button.className = "actBtn";
+  button.textContent = "Copy";
+  button.onclick = async () => {
+    const copied = await copyText(text);
+    button.textContent = copied ? "Copied" : "Could not copy";
+    setTimeout(() => { button.textContent = "Copy"; }, 1600);
+  };
+  row.appendChild(button);
+  node.appendChild(row);
+}
+
+/* The send button is dead until there is something to send, the way the round
+   button in a chat window behaves. */
+function updateSend() {
+  const box = el("questionInput");
+  const button = el("askBtn");
+  if (!box || !button) return;
+  button.disabled = state.busy || !box.value.trim();
 }
 
 /* ------------------------------------------------------------------- models
@@ -734,6 +818,19 @@ function showStopped() {
   }
 }
 
+/* Light, dark, or whatever the machine's own setting is. Kept in the browser
+   only - it is a property of this screen, not of the library. */
+function appearanceCardHtml() {
+  const choice = currentTheme();
+  const options = [["auto", "Automatic"], ["light", "Light"], ["dark", "Dark"]];
+  return '<div class="modelCard">' +
+    '<div class="modelRow"><div class="modelName">Appearance</div></div>' +
+    '<div class="segRow" id="themeRow">' +
+    options.map(([value, label]) => '<button data-theme-choice="' + value + '"' +
+      (choice === value ? ' class="on"' : "") + ">" + label + "</button>").join("") +
+    "</div></div>";
+}
+
 function settingsFormHtml() {
   const settings = state.settings || {};
   const fields = SETTING_FIELDS.map((field) => {
@@ -749,7 +846,7 @@ function settingsFormHtml() {
       '" type="' + type + '" value="' + escapeHtml(String(value === undefined ? "" : value)) + '"></div>';
   }).join("");
   if (!fields) return '<div class="field hint">No settings could be built.</div>';
-  return windowCardHtml() +
+  return appearanceCardHtml() + windowCardHtml() +
     '<div id="modelBox"><div class="field hint">Loading the model list...</div></div>' +
     '<details class="adv"><summary>Retrieval, model size and advanced settings</summary>' +
     '<div class="advBody">' + fields + "</div></details>" +
@@ -824,6 +921,11 @@ function openSettings() {
       reingest.textContent = label;
     }
   };
+  const themeRow = el("themeRow");
+  if (themeRow) themeRow.onclick = (event) => {
+    const button = event.target.closest("[data-theme-choice]");
+    if (button) setTheme(button.dataset.themeChoice);
+  };
   el("settingsSheet").hidden = false;
   el("scrim").hidden = false;
   refreshModels().then(() => scheduleModelPoll());
@@ -832,7 +934,26 @@ function openSettings() {
 function closeSettings() {
   stopModelPoll();
   el("settingsSheet").hidden = true;
-  el("scrim").hidden = true;
+  if (!document.body.classList.contains("drawerOpen")) el("scrim").hidden = true;
+}
+
+/* The library is a drawer over the conversation on a phone, and a column that
+   can be put away on a wide screen. One button in the top bar brings it back. */
+function openDrawer() {
+  document.body.classList.add("drawerOpen");
+  el("scrim").hidden = false;
+}
+
+function closeDrawer() {
+  document.body.classList.remove("drawerOpen");
+  if (el("settingsSheet").hidden) el("scrim").hidden = true;
+}
+
+/* Growing the box as the question grows, up to a point, is most of what makes a
+   composer feel like a composer rather than a form. */
+function autoGrow(box) {
+  box.style.height = "auto";
+  box.style.height = Math.min(box.scrollHeight, 200) + "px";
 }
 
 /* -------------------------------------------------------------------- events */
@@ -844,17 +965,32 @@ function wire() {
     if (pasteRow) pasteRow.hidden = true;
     if (el("dropzone")) el("dropzone").hidden = true;
   }
-  el("askBtn").onclick = () => { const q = el("questionInput").value; el("questionInput").value = ""; ask(q); };
+  el("askBtn").onclick = () => {
+    const q = el("questionInput").value;
+    el("questionInput").value = "";
+    autoGrow(el("questionInput"));
+    ask(q);
+  };
   el("questionInput").addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       const q = el("questionInput").value;
       el("questionInput").value = "";
+      autoGrow(el("questionInput"));
       ask(q);
     }
   });
+  el("questionInput").addEventListener("input", () => {
+    autoGrow(el("questionInput"));
+    updateSend();
+  });
   document.querySelectorAll(".chip.example").forEach((chip) => {
-    chip.onclick = () => { el("questionInput").value = chip.textContent; el("questionInput").focus(); };
+    chip.onclick = () => {
+      el("questionInput").value = chip.textContent;
+      autoGrow(el("questionInput"));
+      updateSend();
+      el("questionInput").focus();
+    };
   });
 
   el("addPathBtn").onclick = async () => {
@@ -914,8 +1050,9 @@ function wire() {
   });
 
   el("settingsBtn").onclick = openSettings;
+  if (el("settingsBtn2")) el("settingsBtn2").onclick = openSettings;
   el("closeSettingsBtn").onclick = closeSettings;
-  el("scrim").onclick = closeSettings;
+  el("scrim").onclick = () => { closeSettings(); closeDrawer(); };
   if (el("setupModelChip")) el("setupModelChip").onclick = openSettings;
   el("settingsBody").addEventListener("click", (event) => {
     const button = event.target.closest("[data-model-action]");
@@ -924,20 +1061,37 @@ function wire() {
     handleModelAction(button);
   });
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !el("settingsSheet").hidden) closeSettings();
+    if (event.key !== "Escape") return;
+    closeDrawer();
+    if (!el("settingsSheet").hidden) closeSettings();
   });
-  el("collapseBtn").onclick = () => {
-    state.libraryHidden = !state.libraryHidden;
-    document.querySelector(".layout").classList.toggle("solo", state.libraryHidden);
-    el("collapseBtn").innerHTML = state.libraryHidden ? "&#9654;" : "&#9664;";
-  };
+
+  // The library: a drawer over the conversation on a phone, a column that can
+  // be put away on a wide screen, and one button either way.
+  el("menuBtn").onclick = () => { if (isNarrow()) openDrawer(); else document.body.classList.remove("libraryHidden"); };
+  el("closeSidebarBtn").onclick = () => { if (isNarrow()) closeDrawer(); else document.body.classList.add("libraryHidden"); };
+  // Choosing something out of the library is usually the end of the errand.
+  if (el("pickBtn")) el("pickBtn").addEventListener("click", () => { if (isNarrow()) closeDrawer(); });
+  updateSend();
 }
 
 async function boot() {
   wire();
+  // Automatic means what the machine's own setting says, and that can change
+  // while the app is open - at sunset, on a timer.
+  if (window.matchMedia) {
+    const watcher = window.matchMedia("(prefers-color-scheme: dark)");
+    const follow = () => { if (currentTheme() === "auto") applyTheme("auto"); };
+    if (watcher.addEventListener) watcher.addEventListener("change", follow);
+    else if (watcher.addListener) watcher.addListener(follow);
+  }
   try {
     await loadHealth();
     await loadLibrary();
+    // A phone starts with the library put away. With nothing in it that is an
+    // empty screen and no explanation of how to fill it, so the drawer opens
+    // itself the first time - and only while there is nothing in there.
+    if (isNarrow() && !state.docs.length) openDrawer();
   } catch (error) {
     const message = friendlyError(error);
     el("statusLine").textContent = "cannot reach the AURA backend";
