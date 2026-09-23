@@ -1,0 +1,9 @@
+# Optional extras - install only if you want these features.
+#
+# Semantic search (understands paraphrases, not just keywords):
+#     pip install -r requirements-embeddings.txt
+#
+# A local LLM for written answers instead of extracted sentences:
+#     pip install -r requirements-llm.txt
+
+fastembed>=0.2.7

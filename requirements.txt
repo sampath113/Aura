@@ -1,0 +1,9 @@
+# AURA - desktop app dependencies
+#
+# Deliberately minimal: everything here ships prebuilt wheels for Windows, Linux
+# and macOS, so `pip install -r requirements.txt` never needs a compiler. That
+# matters because the Windows build runs under Wine, where no compiler exists.
+
+pypdf>=4.2,<6            # PDF text extraction, one page at a time
+python-docx>=1.1,<2      # DOCX paragraphs and tables (brings lxml, which has wheels)
+Pillow>=10.2             # photos of notes, image metadata, screenshot ingestion

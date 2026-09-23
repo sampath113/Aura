@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AURA - Agentic Multimodal Research Assistant</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand">
+      <div class="mark">AURA</div>
+      <div class="brandText">
+        <div class="brandName">Agentic Multimodal Research Assistant</div>
+        <div class="brandSub" id="statusLine">starting...</div>
+      </div>
+    </div>
+    <div class="topActions">
+      <span class="pill" id="backendPill" title="language model in use">extractive</span>
+      <span class="pill" id="indexPill" title="indexed passages">0 passages</span>
+      <span class="pill" id="densePill" title="semantic search">keyword only</span>
+      <button class="ghost" id="settingsBtn" title="Settings">Settings</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="panel library" id="libraryPanel">
+      <div class="panelHead">
+        <h2>Library</h2>
+        <button class="ghost small" id="collapseBtn" title="Hide">&#9664;</button>
+      </div>
+
+      <div class="addRow">
+        <input type="text" id="pathInput" placeholder="paste a file or folder path">
+        <button class="primary" id="addPathBtn">Add</button>
+      </div>
+      <div class="addRow">
+        <button class="ghost" id="pickBtn">Choose files</button>
+        <button class="ghost" id="addFolderBtn">Add folder</button>
+        <input type="file" id="filePicker" multiple hidden>
+      </div>
+      <div class="dropzone" id="dropzone">Drop PDFs, notes, spreadsheets or images here</div>
+
+      <div class="docList" id="docList"></div>
+      <div class="stats" id="statsBox"></div>
+    </aside>
+
+    <section class="panel chat">
+      <div class="chatScroll" id="chatScroll">
+        <div class="empty" id="emptyState">
+          <h1>Ask your own library</h1>
+          <p>Everything stays on this machine. Add your course PDFs, lecture notes,
+             spreadsheets or photos of the whiteboard, then ask questions in plain
+             language - every answer comes back with the page it came from.</p>
+          <div class="chips" id="exampleChips">
+            <button class="chip example">Summarise the key definitions</button>
+            <button class="chip example">What are the main formulas?</button>
+            <button class="chip example">Compare the approaches mentioned</button>
+          </div>
+        </div>
+      </div>
+      <div class="composer">
+        <textarea id="questionInput" rows="2" placeholder="Ask a question about your documents..."></textarea>
+        <button class="primary big" id="askBtn">Ask</button>
+      </div>
+      <div class="composerHint" id="composerHint">Enter to ask &middot; Shift+Enter for a new line</div>
+    </section>
+  </main>
+
+  <div class="scrim" id="scrim" hidden></div>
+  <section class="sheet" id="settingsSheet" hidden>
+    <div class="sheetHead">
+      <h2>Settings</h2>
+      <button class="ghost" id="closeSettingsBtn">Close</button>
+    </div>
+    <div class="sheetBody" id="settingsBody"></div>
+  </section>
+</div>
+<script src="/app.js"></script>
+</body>
+</html>

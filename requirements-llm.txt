@@ -1,0 +1,13 @@
+# A local language model, so AURA writes its own answers instead of extracting
+# sentences from your sources. Requires a .gguf model file, e.g. Qwen2.5-1.5B or
+# Qwen2.5-3B-Instruct from Hugging Face; then set the path in Settings
+# ("Path to a local .gguf model") or run:
+#     AURA.exe --ask "..." --help
+#
+# Wheels are published for Windows/Linux/macOS CPU builds:
+#     pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+#
+# Nothing else in AURA depends on this package, which keeps the desktop build
+# small and dependency-free.
+
+llama-cpp-python>=0.2.79
