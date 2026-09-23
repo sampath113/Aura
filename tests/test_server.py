@@ -7,15 +7,19 @@ with no networking at all.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from aura import llama_server, server  # noqa: E402
 from aura.server import Handler, Api  # noqa: E402
 from aura.store import Library  # noqa: E402
 
@@ -81,6 +85,7 @@ class ServerTests(unittest.TestCase):
         self.handler_cls = type("BoundHandler", (Handler,), {"api": self.api})
 
     def tearDown(self):
+        llama_server.reset()
         self.temp.cleanup()
 
     def get(self, path, **kwargs):
@@ -168,6 +173,22 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(json.loads(body)["removed"])
         self.assertEqual(self.library.stats()["documents"], 0)
 
+    def test_reingest_rebuilds_the_library_from_disk(self):
+        target = self.root / "notes.md"
+        target.write_text("# Title\n\nOsmosis moves water across a membrane.\n", encoding="utf-8")
+        status, _headers, body = self.post("/api/add", {"path": str(target)})
+        self.assertEqual(status, 200, body)
+        target.write_text("# Title\n\nRibosomes assemble proteins from amino acids.\n", encoding="utf-8")
+
+        status, _headers, body = self.post("/api/reingest", {})
+        self.assertEqual(status, 200, body)
+        payload = json.loads(body)
+        self.assertEqual(payload["reingested"], 1)
+        self.assertEqual(payload["skipped"], [])
+        self.assertEqual(self.library.stats()["documents"], 1)
+        status, _headers, body = self.post("/api/ask", {"question": "what assembles proteins"})
+        self.assertIn("ribosome", json.loads(body)["text"].lower())
+
     def test_settings_round_trip_over_http(self):
         status, _headers, body = self.post("/api/settings", {"top_k": 4, "bogus_key": 1})
         self.assertEqual(status, 200)
@@ -188,6 +209,148 @@ class ServerTests(unittest.TestCase):
         status, _headers, body = self.post("/api/ask", raw=big)
         self.assertIn(status, (400, 500))
         self.assertIn("error", json.loads(body))
+
+    # ------------------------------------------------------------------- models
+    def wait_for_job(self, job_id, timeout=15.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            _status, _headers, body = self.get("/api/jobs/" + job_id)
+            job = json.loads(body)["job"]
+            if job["done"]:
+                return job
+            time.sleep(0.05)
+        self.fail("the job never finished")
+
+    def test_health_reports_the_local_model_state(self):
+        status, _headers, body = self.get("/health")
+        self.assertEqual(status, 200)
+        model = json.loads(body)["model"]
+        self.assertEqual(model["state"], "stopped")
+        self.assertFalse(model["engine_installed"])
+        self.assertIn("models_dir", model)
+
+    def test_models_endpoint_lists_every_model_aura_can_fetch(self):
+        status, _headers, body = self.get("/api/models")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(len(payload["catalog"]), len(server.catalog.MODELS))
+        self.assertEqual(payload["installed"], [])
+        self.assertEqual(payload["selected"], "")
+        first = payload["catalog"][0]
+        for key in ("id", "name", "size", "bytes", "ram_gb", "license", "state", "path", "note"):
+            self.assertIn(key, first)
+        self.assertTrue(any(model["recommended"] for model in payload["catalog"]))
+
+    def test_an_unknown_model_id_cannot_be_downloaded(self):
+        status, _headers, body = self.post("/api/model/download", {"id": "not-a-model"})
+        self.assertEqual(status, 400)
+        self.assertIn("I do not know a model", body)
+
+    def test_downloading_a_model_runs_as_a_job_and_becomes_the_chosen_one(self):
+        name = "tiny-test.gguf"
+        payload = b"tiny model bytes"
+        entry = {
+            "id": "tiny-test", "name": "Tiny Test", "params": "0.1B", "quant": "Q4", "bytes": len(payload),
+            "context": 512, "ram_gb": 1, "license": "test", "note": "a test model",
+            "recommended": False, "file": name, "repo_url": "",
+            "files": [{"name": name, "bytes": len(payload), "url": "https://example.test/tiny.gguf",
+                       "sha256": hashlib.sha256(payload).hexdigest()}],
+        }
+
+        def fake_download(url, dest, expected_bytes=0, sha256="", on_progress=None,
+                          cancelled=None, timeout=60.0, opener=None):
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_bytes(payload)
+            if on_progress:
+                on_progress(len(payload), len(payload))
+            self.assertEqual(expected_bytes, len(payload))
+            self.assertEqual(sha256, hashlib.sha256(payload).hexdigest())
+            return Path(dest)
+
+        with mock.patch.object(server.catalog, "entry", return_value=entry), \
+                mock.patch.object(server.downloads, "download", fake_download):
+            status, _headers, body = self.post("/api/model/download", {"id": "tiny-test"})
+            self.assertEqual(status, 200, body)
+            job = self.wait_for_job(json.loads(body)["job_id"])
+
+        self.assertEqual(job["state"], "done", job)
+        self.assertEqual(job["result"]["model"], "tiny-test")
+        saved = self.root / "models" / name
+        self.assertTrue(saved.exists())
+        self.assertEqual(self.library.settings["llm_model_path"], str(saved))
+        self.assertIn("engine", job["result"]["engine_detail"])
+
+        status, _headers, body = self.get("/api/models")
+        payload_after = json.loads(body)
+        self.assertEqual(payload_after["selected"], str(saved))
+        self.assertTrue(any(item["name"] == name for item in payload_after["installed"]))
+
+    def test_a_model_on_disk_can_be_chosen_and_removed(self):
+        folder = self.root / "models"
+        folder.mkdir()
+        model = folder / "custom.gguf"
+        model.write_bytes(b"x")
+
+        status, _headers, body = self.post("/api/model/select", {"path": str(model)})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["selected"], str(model))
+        self.assertEqual(self.library.settings["llm_model_path"], str(model))
+
+        status, _headers, body = self.post("/api/model/select", {"path": ""})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.library.settings["llm_model_path"], "")
+
+        self.post("/api/model/select", {"path": str(model)})
+        status, _headers, body = self.post("/api/model/delete", {"path": str(model)})
+        self.assertEqual(status, 200, body)
+        self.assertFalse(model.exists())
+        self.assertEqual(self.library.settings["llm_model_path"], "")
+
+    def test_only_files_inside_the_models_folder_can_be_deleted(self):
+        outside = self.root / "notes.md"
+        outside.write_text("keep me", encoding="utf-8")
+        status, _headers, body = self.post("/api/model/delete", {"path": str(outside)})
+        self.assertEqual(status, 400)
+        self.assertIn("only files inside", body)
+        self.assertTrue(outside.exists())
+
+    def test_a_model_that_is_not_a_gguf_is_refused(self):
+        odd = self.root / "model.txt"
+        odd.write_text("not a model", encoding="utf-8")
+        status, _headers, body = self.post("/api/model/select", {"path": str(odd)})
+        self.assertEqual(status, 400)
+        self.assertIn(".gguf", body)
+
+    def test_starting_without_a_model_says_so(self):
+        status, _headers, body = self.post("/api/model/start", {})
+        self.assertEqual(status, 400)
+        self.assertIn("no model has been chosen", body)
+
+    def test_stopping_when_nothing_runs_is_harmless(self):
+        status, _headers, body = self.post("/api/model/stop", {})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["engine"]["state"], "stopped")
+
+    def test_job_routes(self):
+        status, _headers, body = self.get("/api/jobs")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["jobs"], [])
+
+        _status, _headers, body = self.post("/api/model/download", {"id": "nope"})
+        status, _headers, body = self.get("/api/jobs/does-not-exist")
+        self.assertEqual(status, 400)
+        self.assertIn("no job called", body)
+        status, _headers, body = self.post("/api/jobs/does-not-exist/cancel", {})
+        self.assertEqual(status, 400)
+        self.assertIn("no job called", body)
+
+    def test_a_settings_change_does_not_touch_the_model_choice(self):
+        status, _headers, body = self.post("/api/settings", {"llm_n_ctx": 8192, "llm_threads": 2})
+        self.assertEqual(status, 200)
+        settings = json.loads(body)["settings"]
+        self.assertEqual(settings["llm_n_ctx"], 8192)
+        self.assertEqual(settings["llm_threads"], 2)
+        self.assertEqual(settings["llm_model_path"], "")
 
 
 if __name__ == "__main__":

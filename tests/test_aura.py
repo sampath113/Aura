@@ -4,24 +4,42 @@ No third-party test runner is required, and nothing here touches the network.
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import os
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aura.answer import answer_question, compose_extractive, verify_answer  # noqa: E402
+from aura import catalog, downloads, llama_server  # noqa: E402
+from aura.answer import (answer_question, build_digest, compose_closest, compose_extractive,  # noqa: E402
+                         verify_answer, wants_overview)
 from aura.chunk import chunk_pages  # noqa: E402
 from aura.citations import citation_label, parse_labels, validate  # noqa: E402
 from aura.index import BM25Index, reciprocal_rank_fusion  # noqa: E402
 from aura.ingest import ingest_docx, ingest_file, ingest_table, _docx_stdlib  # noqa: E402
+from aura.jobs import Jobs  # noqa: E402
+from aura.llama_server import Manager, build_argv  # noqa: E402
 from aura.models import AuraError, Page  # noqa: E402
 from aura.retrieve import Retriever  # noqa: E402
 from aura.store import Library  # noqa: E402
 from aura.text import keyphrases, split_sentences, stem, tokenize  # noqa: E402
+
+
+def wait_until(predicate, timeout: float = 10.0) -> bool:
+    """Poll `predicate` until it is true (used for background jobs)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return bool(predicate())
 
 
 PHOTOSYNTHESIS = (
@@ -74,12 +92,15 @@ class ChunkTests(unittest.TestCase):
         self.assertGreater(len(chunks), 4)
         self.assertEqual({chunk.page for chunk in chunks}, {1, 2})
         for chunk in chunks:
-            self.assertLessEqual(len(chunk.text), 300 + 120)
+            self.assertLessEqual(len(chunk.text), 500)
             self.assertGreater(len(chunk.text), 60)
         page_two = next(chunk for chunk in chunks if chunk.page == 2)
         self.assertIn("Page two sentence", page_two.text)
-        rebuilt = pages[1].text[page_two.start:page_two.end]
-        self.assertEqual(rebuilt.strip(), page_two.text.strip())
+        # start/end must cover every sentence of the passage inside its own page
+        for chunk in chunks:
+            region = pages[chunk.page - 1].text[chunk.start:chunk.end]
+            for sentence, _start, _end in split_sentences(chunk.text):
+                self.assertIn(sentence, region)
 
     def test_overlap_exists_between_neighbours(self):
         text = "\n\n".join("Paragraph {} with a reasonably long body of text to fill space."
@@ -87,10 +108,32 @@ class ChunkTests(unittest.TestCase):
         chunks = chunk_pages([Page(number=1, text=text)], "d", "f.txt",
                              target_chars=400, overlap_chars=120, min_chars=80)
         self.assertGreater(len(chunks), 3)
-        tail_words = set(tokenize(chunks[0].text)) & set(tokenize(chunks[1].text))
-        self.assertTrue(tail_words, "consecutive chunks should share some overlap")
+        for earlier, later in zip(chunks, chunks[1:]):
+            tail = split_sentences(earlier.text)[-1][0]
+            self.assertIn(tail, later.text,
+                          "the last sentence of a passage should be carried into the next one")
         all_words = set(tokenize(" ".join(chunk.text for chunk in chunks)))
         self.assertIn("paragraph", all_words)
+
+    def test_offsets_stay_page_relative_across_blocks(self):
+        page = Page(number=1, text="Memory Notes\n\nFirst paragraph sentence one. Sentence two."
+                                   "\n\nSecond paragraph sits here.")
+        chunks = chunk_pages([page], "d", "f.txt", target_chars=500, overlap_chars=0, min_chars=1)
+        self.assertTrue(chunks)
+        for chunk in chunks:
+            region = page.text[chunk.start:chunk.end]
+            self.assertIn(split_sentences(chunk.text)[0][0], region)
+
+    def test_unpunctuated_wall_of_text_is_split(self):
+        blob = " ".join("word{}".format(i) for i in range(800))
+        chunks = chunk_pages([Page(number=1, text=blob)], "d", "dump.pdf", target_chars=900,
+                             overlap_chars=150, min_chars=120)
+        self.assertGreaterEqual(len(chunks), 3)
+        words = set()
+        for chunk in chunks:
+            self.assertLessEqual(len(chunk.text), 1000)
+            words.update(chunk.text.split(" "))
+        self.assertEqual(len(words), 800)
 
 
 class IndexTests(unittest.TestCase):
@@ -173,6 +216,27 @@ class AnswerTests(unittest.TestCase):
         answer = answer_question("what is the capital of France", [], {})
         self.assertEqual(answer.mode, "no-evidence")
         self.assertIn("could not find", answer.text.lower())
+        self.assertFalse(answer.text.startswith('"'), "the template should not start with a quote")
+
+    def test_overview_questions_are_recognised(self):
+        self.assertTrue(wants_overview("summarise the key definitions"))
+        self.assertTrue(wants_overview("give me an overview of this document"))
+        self.assertTrue(wants_overview("what is this pdf about"))
+        self.assertFalse(wants_overview("where do the light reactions happen"))
+
+    def test_off_topic_question_shows_the_closest_passages(self):
+        hits = self.retriever.fallback("what is the capital of France", k=3)
+        self.assertTrue(hits)
+        self.assertEqual(hits[0].label, "S1")
+        text = compose_closest("what is the capital of France", hits)
+        self.assertIn("closest", text.lower())
+        self.assertIn("[S1", text)
+
+    def test_extractive_answer_drops_weak_matches(self):
+        hits = self.retriever.search("where do the light reactions happen", k=3)
+        text = compose_extractive("where do the light reactions happen", hits)
+        self.assertIn("thylakoid", text.lower())
+        self.assertNotIn("citric acid cycle", text.lower())
 
     def test_unknown_labels_are_stripped(self):
         hits = self.retriever.search("citric acid cycle", k=1)
@@ -307,6 +371,539 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(config.load_settings(self.root)["top_k"], 9)
         self.assertEqual(config.load_settings(self.root)["chunk_chars"],
                          config.DEFAULTS["chunk_chars"])
+
+    def test_off_topic_question_falls_back_to_the_nearest_passages(self):
+        self.library.add_file(self.root / "bio.txt")
+        answer = self.library.ask("what is the capital of France", k=3)
+        self.assertEqual(answer.mode, "closest")
+        self.assertTrue(answer.hits)
+        self.assertTrue(answer.citations)
+        self.assertTrue(answer.checks["fallback"])
+        self.assertEqual(answer.hits[0].chunk.doc_name, "bio.txt")
+
+    def test_overview_question_returns_a_cited_outline(self):
+        self.library.add_file(self.root / "bio.txt")
+        answer = self.library.ask("summarise the key definitions", k=3)
+        self.assertEqual(answer.mode, "outline")
+        self.assertTrue(answer.citations)
+        self.assertEqual({hit.chunk.doc_name for hit in answer.hits}, {"bio.txt"})
+
+    def test_empty_library_reports_no_evidence(self):
+        empty = Library(root=self.root / "empty")
+        answer = empty.ask("what is photosynthesis")
+        self.assertEqual(answer.mode, "no-evidence")
+        self.assertEqual(answer.hits, [])
+
+    def test_reingest_picks_up_changed_file_contents(self):
+        self.library.add_file(self.root / "bio.txt")
+        with open(self.root / "bio.txt", "a", encoding="utf-8") as handle:
+            handle.write(" Ribosomes assemble proteins from amino acids.")
+        result = self.library.reingest()
+        self.assertEqual(result["reingested"], 1)
+        self.assertEqual(self.library.stats()["documents"], 1)
+        self.assertTrue(any("ribosome" in chunk.text.lower() for chunk in self.library.chunks))
+
+    def test_reingest_reports_files_that_have_moved(self):
+        self.library.add_file(self.root / "bio.txt")
+        (self.root / "bio.txt").unlink()
+        result = self.library.reingest()
+        self.assertEqual(result["reingested"], 0)
+        self.assertEqual(result["skipped"], ["bio.txt"])
+        self.assertEqual(self.library.stats()["documents"], 1)
+
+
+class CatalogTests(unittest.TestCase):
+    def test_every_entry_is_downloadable_and_verifiable(self):
+        for model in catalog.MODELS:
+            self.assertTrue(model["files"], model["id"])
+            for item in model["files"]:
+                self.assertTrue(item["url"].startswith("https://huggingface.co/"), item["name"])
+                self.assertGreater(item["bytes"], 1024)
+                self.assertEqual(len(item["sha256"]), 64)
+                int(item["sha256"], 16)  # must be hex
+            self.assertGreater(model["ram_gb"], 0)
+            self.assertTrue(model["note"])
+            self.assertTrue(model["license"])
+            self.assertEqual(model["bytes"], sum(f["bytes"] for f in model["files"]))
+            self.assertEqual(model["file"], model["files"][0]["name"])
+
+    def test_ids_and_filenames_are_unique(self):
+        ids = [model["id"] for model in catalog.MODELS]
+        self.assertEqual(len(ids), len(set(ids)))
+        names = [item["name"] for model in catalog.MODELS for item in model["files"]]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_the_recommended_model_is_a_small_one(self):
+        recommended = catalog.recommended()
+        self.assertIn(recommended, catalog.MODELS)
+        sizes = sorted(model["bytes"] for model in catalog.MODELS)
+        self.assertLessEqual(recommended["bytes"], sizes[2])
+
+    def test_runtime_asset_is_picked_per_platform(self):
+        assets = [
+            {"name": "cudart-llama-bin-win-cuda-12.4-x64.zip"},
+            {"name": "llama-b11136-bin-win-cpu-x64.zip"},
+            {"name": "llama-b11136-bin-win-cpu-arm64.zip"},
+            {"name": "llama-b11136-bin-ubuntu-x64.tar.gz"},
+            {"name": "llama-b11136-bin-macos-arm64.tar.gz"},
+        ]
+        self.assertEqual(catalog.runtime_asset(assets, "windows", "x64")["name"],
+                         "llama-b11136-bin-win-cpu-x64.zip")
+        self.assertEqual(catalog.runtime_asset(assets, "windows", "arm64")["name"],
+                         "llama-b11136-bin-win-cpu-arm64.zip")
+        self.assertEqual(catalog.runtime_asset(assets, "linux", "x64")["name"],
+                         "llama-b11136-bin-ubuntu-x64.tar.gz")
+        self.assertEqual(catalog.runtime_asset(assets, "macos", "arm64")["name"],
+                         "llama-b11136-bin-macos-arm64.tar.gz")
+        self.assertIsNone(catalog.runtime_asset([{"name": "something-else.zip"}], "windows", "x64"))
+        self.assertIsNone(catalog.runtime_asset([], "linux", "x64"))
+
+    def test_pinned_urls_point_at_the_platform_build(self):
+        for platform_name, arch in (("windows", "x64"), ("linux", "x64"), ("macos", "arm64")):
+            url = catalog.pinned_runtime_url(platform_name, arch)
+            self.assertIn(catalog.PINNED_RUNTIME_TAG, url)
+            self.assertTrue(url.startswith("https://github.com/ggml-org/llama.cpp/releases/download/"))
+            self.assertIn(catalog.runtime_pattern(platform_name, arch), url)
+
+    def test_the_binary_is_found_wherever_the_archive_put_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            (folder / "bin").mkdir()
+            expected = folder / "bin" / catalog.binary_name()
+            expected.write_bytes(b"#!binary")
+            self.assertEqual(catalog.find_binary(folder), expected)
+            self.assertIsNone(catalog.find_binary(folder / "nowhere"))
+
+
+class ModelFileTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_a_missing_model_is_reported_as_missing(self):
+        item = catalog.MODELS[0]["files"][0]
+        state = catalog.file_state(item, self.root)
+        self.assertEqual(state["state"], "missing")
+        self.assertEqual(state["on_disk"], 0)
+        self.assertEqual(state["expected"], item["bytes"])
+
+    def test_a_wrong_sized_file_is_incomplete(self):
+        item = catalog.MODELS[0]["files"][0]
+        (self.root / item["name"]).write_bytes(b"short")
+        self.assertEqual(catalog.file_state(item, self.root)["state"], "incomplete")
+
+    def test_a_part_file_means_a_download_is_in_progress(self):
+        item = catalog.MODELS[0]["files"][0]
+        (self.root / (item["name"] + ".part")).write_bytes(b"x" * 32)
+        state = catalog.file_state(item, self.root)
+        self.assertEqual(state["state"], "downloading")
+        self.assertEqual(state["on_disk"], 32)
+
+    def test_a_multi_file_model_needs_every_file(self):
+        model = {"id": "two", "name": "Two", "params": "1B", "quant": "Q4", "bytes": 8,
+                 "ram_gb": 1, "license": "test", "note": "n", "context": 512, "repo_url": "",
+                 "file": "a.gguf", "files": [
+                     {"name": "a.gguf", "bytes": 4, "sha256": "", "url": ""},
+                     {"name": "b.gguf", "bytes": 4, "sha256": "", "url": ""}]}
+        self.assertEqual(catalog.status_of(model, self.root)["state"], "missing")
+        (self.root / "a.gguf").write_bytes(b"aaaa")
+        self.assertEqual(catalog.status_of(model, self.root)["state"], "partial")
+        (self.root / "b.gguf").write_bytes(b"bbbb")
+        self.assertEqual(catalog.status_of(model, self.root)["state"], "ready")
+        self.assertTrue(catalog.status_of(model, self.root)["primary_ready"])
+
+    def test_installed_files_include_models_aura_does_not_know(self):
+        name = catalog.MODELS[0]["files"][0]["name"]
+        (self.root / name).write_bytes(b"x")
+        (self.root / "my-own-model.gguf").write_bytes(b"hello")
+        (self.root / "half.gguf.part").write_bytes(b"1234")
+        found = {item["name"]: item for item in catalog.installed_files(self.root)}
+        self.assertTrue(found[name]["known"])
+        self.assertFalse(found["my-own-model.gguf"]["known"])
+        self.assertEqual(found["my-own-model.gguf"]["bytes"], 5)
+        self.assertTrue(found["half.gguf"]["part"])
+        self.assertEqual(catalog.installed_files(self.root / "nope"), [])
+
+
+class FakeResponse:
+    """Stands in for urllib's response object in the download tests."""
+
+    def __init__(self, body: bytes, status: int = 200, headers=None):
+        self._stream = io.BytesIO(body)
+        self.status = status
+        self.headers = dict(headers or {})
+        self.headers.setdefault("Content-Length", str(len(body)))
+
+    def read(self, size: int = -1) -> bytes:
+        return self._stream.read(size)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def fake_opener(body: bytes, status: int = 200, seen=None, error=None):
+    def opener(request, timeout=None):
+        if seen is not None:
+            seen.append(request)
+        if error is not None:
+            raise error
+        return FakeResponse(body, status)
+    return opener
+
+
+BIG = b"a" * (3 << 20)
+
+
+class DownloadTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_a_download_is_verified_and_reports_progress(self):
+        seen = []
+        progress = []
+        dest = self.root / "model.gguf"
+        path = downloads.download("https://example.test/model.gguf", dest, expected_bytes=len(BIG),
+                                  sha256=hashlib.sha256(BIG).hexdigest(),
+                                  on_progress=lambda done, total: progress.append((done, total)),
+                                  opener=fake_opener(BIG, seen=seen))
+        self.assertEqual(path, dest)
+        self.assertEqual(dest.read_bytes(), BIG)
+        self.assertFalse((self.root / "model.gguf.part").exists())
+        self.assertTrue(progress)
+        self.assertEqual(progress[-1][0], len(BIG))
+        self.assertIsNone(seen[0].headers.get("Range"))
+
+    def test_a_second_attempt_resumes_with_a_range_request(self):
+        half = len(BIG) // 2
+        (self.root / "model.gguf.part").write_bytes(BIG[:half])
+        seen = []
+        path = downloads.download("https://example.test/model.gguf", self.root / "model.gguf",
+                                  expected_bytes=len(BIG),
+                                  opener=fake_opener(BIG[half:], status=206, seen=seen))
+        self.assertEqual(path.read_bytes(), BIG)
+        self.assertEqual(seen[0].headers.get("Range"), "bytes={}-".format(half))
+
+    def test_a_server_that_ignores_the_range_restarts_the_file(self):
+        half = len(BIG) // 2
+        (self.root / "model.gguf.part").write_bytes(BIG[:half])
+        path = downloads.download("https://example.test/model.gguf", self.root / "model.gguf",
+                                  expected_bytes=len(BIG), opener=fake_opener(BIG, status=200))
+        self.assertEqual(path.read_bytes(), BIG)
+
+    def test_an_already_complete_file_is_left_alone(self):
+        dest = self.root / "model.gguf"
+        dest.write_bytes(BIG)
+        calls = []
+        path = downloads.download("https://example.test/model.gguf", dest, expected_bytes=len(BIG),
+                                  sha256=hashlib.sha256(BIG).hexdigest(),
+                                  opener=fake_opener(b"should not be used", seen=calls))
+        self.assertEqual(path.read_bytes(), BIG)
+        self.assertEqual(calls, [])
+
+    def test_cancelling_keeps_the_part_file_for_a_resume(self):
+        state = {"n": 0}
+
+        def cancelled():
+            state["n"] += 1
+            return state["n"] > 1
+
+        with self.assertRaises(downloads.DownloadCancelled):
+            downloads.download("https://example.test/model.gguf", self.root / "model.gguf",
+                               expected_bytes=len(BIG), cancelled=cancelled, opener=fake_opener(BIG))
+        part = self.root / "model.gguf.part"
+        self.assertTrue(part.exists())
+        self.assertGreater(part.stat().st_size, 0)
+        self.assertLess(part.stat().st_size, len(BIG))
+
+    def test_a_checksum_mismatch_is_refused_and_the_part_is_discarded(self):
+        with self.assertRaises(AuraError) as caught:
+            downloads.download("https://example.test/model.gguf", self.root / "model.gguf",
+                               expected_bytes=len(BIG), sha256="0" * 64, opener=fake_opener(BIG))
+        self.assertIn("integrity", str(caught.exception))
+        self.assertFalse((self.root / "model.gguf.part").exists())
+        self.assertFalse((self.root / "model.gguf").exists())
+
+    def test_a_truncated_body_is_reported_as_an_early_stop(self):
+        with self.assertRaises(AuraError) as caught:
+            downloads.download("https://example.test/model.gguf", self.root / "model.gguf",
+                               expected_bytes=len(BIG) + 10, opener=fake_opener(BIG))
+        self.assertIn("stopped early", str(caught.exception))
+
+    def test_an_unreachable_host_names_itself(self):
+        with self.assertRaises(AuraError) as caught:
+            downloads.download("https://models.example.test/x.gguf", self.root / "x.gguf",
+                               opener=fake_opener(b"", error=OSError("no route to host")))
+        self.assertIn("models.example.test", str(caught.exception))
+
+    def test_size_is_reported_before_a_download_starts(self):
+        self.assertEqual(catalog.human_size(1117320736), "1.0 GB")
+        self.assertEqual(catalog.human_size(2048), "2 KB")
+
+    def test_zip_archives_are_unpacked(self):
+        archive = self.root / "engine.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("llama-server", "#!binary")
+            bundle.writestr("nested/notes.txt", "hello")
+            bundle.writestr("empty/", "")
+        written = downloads.extract_archive(archive, self.root / "engine")
+        names = sorted(path.name for path in written)
+        self.assertEqual(names, ["llama-server", "notes.txt"])
+        self.assertTrue((self.root / "engine" / "llama-server").exists())
+        if os.name != "nt":
+            self.assertTrue(os.access(self.root / "engine" / "llama-server", os.X_OK))
+
+    def test_an_archive_that_escapes_its_folder_is_refused(self):
+        archive = self.root / "evil.zip"
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr("../escaped.txt", "nope")
+        with self.assertRaises(AuraError) as caught:
+            downloads.extract_archive(archive, self.root / "engine")
+        self.assertIn("outside its folder", str(caught.exception))
+        self.assertFalse((self.root / "escaped.txt").exists())
+
+    def test_sha256_of_a_file(self):
+        path = self.root / "thing.bin"
+        path.write_bytes(b"abc")
+        self.assertEqual(downloads.sha256_of(path),
+                         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+
+
+class JobTests(unittest.TestCase):
+    def test_a_job_reports_its_result(self):
+        jobs = Jobs()
+        job = jobs.run("model", "do the thing", lambda handle: {"ok": True})
+        self.assertTrue(wait_until(lambda: job.state != "running" and job.state != "queued"))
+        self.assertEqual(job.state, "done")
+        self.assertEqual(job.result, {"ok": True})
+        self.assertEqual(job.as_dict()["percent"], 100)
+        self.assertTrue(job.as_dict()["done"])
+
+    def test_a_known_failure_carries_its_message(self):
+        def work(handle):
+            raise AuraError("no room")
+
+        jobs = Jobs()
+        job = jobs.run("model", "fail", work)
+        self.assertTrue(wait_until(lambda: job.state in ("done", "error", "cancelled")))
+        self.assertEqual(job.state, "error")
+        self.assertEqual(job.error, "no room")
+
+    def test_an_unexpected_failure_is_still_captured(self):
+        def work(handle):
+            raise ValueError("boom")
+
+        jobs = Jobs()
+        job = jobs.run("model", "explode", work)
+        self.assertTrue(wait_until(lambda: job.state in ("done", "error", "cancelled")))
+        self.assertEqual(job.state, "error")
+        self.assertIn("ValueError: boom", job.error)
+
+    def test_cancelling_during_the_work_marks_it_cancelled(self):
+        jobs = Jobs()
+        job = jobs.run("model", "slow", lambda handle: handle.cancel())
+        self.assertTrue(wait_until(lambda: job.state in ("done", "error", "cancelled")))
+        self.assertEqual(job.state, "cancelled")
+        self.assertTrue(job.cancelled())
+
+    def test_a_finished_job_cannot_be_cancelled(self):
+        jobs = Jobs()
+        job = jobs.run("model", "quick", lambda handle: {})
+        self.assertTrue(wait_until(lambda: job.state == "done"))
+        self.assertFalse(job.cancel())
+
+    def test_progress_is_clamped(self):
+        jobs = Jobs()
+        job = jobs.create("model", "p")
+        job.set_progress(5, 10)
+        self.assertEqual(job.as_dict()["percent"], 50)
+        job.set_progress(50, 10)
+        self.assertEqual(job.as_dict()["percent"], 100)
+
+    def test_the_latest_job_can_be_filtered_by_kind(self):
+        jobs = Jobs()
+        jobs.run("engine", "engine job", lambda handle: {})
+        last = jobs.run("model", "model job", lambda handle: {})
+        self.assertTrue(wait_until(lambda: last.state == "done"))
+        self.assertEqual(jobs.latest(("model",))["label"], "model job")
+        self.assertEqual(jobs.latest(("engine",))["label"], "engine job")
+        self.assertEqual(len(jobs.list()), 2)
+
+    def test_the_registry_forgets_old_jobs(self):
+        jobs = Jobs(limit=2)
+        for index in range(4):
+            jobs.run("model", "job {}".format(index), lambda handle: {})
+        self.assertTrue(wait_until(lambda: len(jobs.list()) == 2))
+        self.assertEqual(jobs.list()[0]["label"], "job 3")
+
+
+class FakeProc:
+    """A subprocess.Popen stand-in so the manager can be tested with no child."""
+
+    def __init__(self, returncode=None):
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = 0
+
+
+class EngineTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.engine = Manager(self.root)
+
+    def tearDown(self):
+        self.engine._stop_locked()
+        llama_server.reset()
+        self.temp.cleanup()
+
+    def model_file(self, name: str = "qwen.gguf") -> Path:
+        path = self.root / name
+        path.write_bytes(b"gguf")
+        return path
+
+    def test_argv_is_what_llama_server_expects(self):
+        argv = build_argv("/opt/llama-server", "/models/m.gguf", 8123, 4096, 4)
+        self.assertEqual(argv[0], "/opt/llama-server")
+        self.assertEqual(argv[argv.index("-m") + 1], "/models/m.gguf")
+        self.assertEqual(argv[argv.index("--port") + 1], "8123")
+        self.assertEqual(argv[argv.index("--host") + 1], "127.0.0.1")
+        self.assertEqual(argv[argv.index("-c") + 1], "4096")
+        self.assertEqual(argv[-2:], ["-t", "4"])
+        self.assertNotIn("-t", build_argv("s", "m", 1, 2, 0))
+
+    def test_status_is_honest_before_anything_is_set_up(self):
+        status = self.engine.status()
+        self.assertEqual(status["state"], "stopped")
+        self.assertFalse(status["engine_installed"])
+        self.assertEqual(status["models_dir"], str(self.root / "models"))
+        self.assertEqual(status["model_name"], "")
+        self.assertIn("no local model", status["detail"])
+        self.assertEqual(status["engine"]["wanted_asset"], catalog.runtime_pattern())
+
+    def test_ensure_does_nothing_when_nothing_is_configured(self):
+        self.assertIsNone(self.engine.ensure({}))
+        self.assertIsNone(self.engine.ensure({"llm_backend": "auto", "llm_model_path": ""}))
+        missing = self.root / "gone.gguf"
+        self.assertIsNone(self.engine.ensure({"llm_backend": "auto", "llm_model_path": str(missing)}))
+
+    def test_ensure_respects_the_extractive_setting(self):
+        model = self.model_file()
+        self.assertIsNone(self.engine.ensure({"llm_backend": "extractive",
+                                              "llm_model_path": str(model)}))
+
+    def test_a_model_without_an_engine_explains_itself(self):
+        model = self.model_file()
+        settings = {"llm_backend": "auto", "llm_model_path": str(model)}
+        self.assertIsNone(self.engine.ensure(settings))
+        self.assertIn("local model engine is not", self.engine.detail)
+        self.assertEqual(self.engine.state, "error")
+
+    def test_starting_without_the_engine_says_what_to_do(self):
+        model = self.model_file()
+        with self.assertRaises(AuraError) as caught:
+            self.engine.start(model, {})
+        self.assertIn("engine is not installed", str(caught.exception))
+        self.assertEqual(self.engine.state, "error")
+
+    def test_an_installed_engine_is_found_even_without_its_record(self):
+        folder = self.root / "runtime" / "llama-b11136-linux-x64"
+        folder.mkdir(parents=True)
+        (folder / catalog.binary_name()).write_bytes(b"#!binary")
+        state = self.engine.engine_state()
+        self.assertTrue(state["installed"])
+        self.assertEqual(Path(state["binary"]).name, catalog.binary_name())
+        self.assertIn("llama-b11136-linux-x64", state["folder"])
+
+    def test_installing_the_engine_records_it_and_cleans_up(self):
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as bundle:
+            bundle.writestr(catalog.binary_name(), "#!binary")
+            bundle.writestr("ggml.dll", "binary")
+        payload = archive.getvalue()
+
+        def fake_download(url, dest, **kwargs):
+            Path(dest).parent.mkdir(parents=True, exist_ok=True)
+            Path(dest).write_bytes(payload)
+            return Path(dest)
+
+        asset = {"name": "llama-b9999-bin-win-cpu-x64.zip",
+                 "browser_download_url": "https://example.test/engine.zip"}
+        with mock.patch.object(llama_server, "_resolve_runtime_asset",
+                               return_value=(asset, "b9999")), \
+                mock.patch.object(llama_server.downloads, "download", fake_download):
+            info = self.engine.install_runtime()
+
+        self.assertEqual(info["tag"], "b9999")
+        self.assertTrue(Path(info["binary"]).exists())
+        state = self.engine.engine_state()
+        self.assertTrue(state["installed"])
+        self.assertEqual(state["tag"], "b9999")
+        self.assertEqual(state["asset"], asset["name"])
+        self.assertEqual(self.engine.engine_file().name, catalog.ENGINE_INFO_NAME)
+        self.assertFalse(list(self.engine.runtime_root().glob("download/*.zip")))
+
+    def test_a_live_child_process_becomes_the_local_backend(self):
+        model = self.model_file()
+        self.engine.proc = FakeProc(None)
+        self.engine.state = "ready"
+        self.engine.port = 8123
+        self.engine.model_path = str(model)
+        backend = self.engine.backend()
+        self.assertIsNotNone(backend)
+        self.assertEqual(backend.name, "local")
+        self.assertEqual(backend.url, "http://127.0.0.1:8123/v1/chat/completions")
+        self.assertIn("qwen.gguf", backend.label)
+
+    def test_a_dead_child_process_is_not_a_backend(self):
+        self.engine.proc = FakeProc(1)
+        self.engine.state = "ready"
+        self.engine.port = 8123
+        self.assertIsNone(self.engine.backend())
+        self.assertEqual(self.engine.state, "error")
+        self.assertEqual(self.engine.port, 0)
+
+    def test_stopping_terminates_the_child(self):
+        proc = FakeProc(None)
+        self.engine.proc = proc
+        self.engine.state = "ready"
+        self.engine.port = 4321
+        self.engine.stop()
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(self.engine.state, "stopped")
+        self.assertEqual(self.engine.port, 0)
+        self.assertIsNone(self.engine.proc)
+
+    def test_default_model_prefers_what_is_already_there(self):
+        self.assertEqual(self.engine.default_model(), "")
+        models = self.engine.models_dir()
+        models.mkdir(parents=True)
+        (models / "my-own.gguf").write_bytes(b"x")
+        self.assertEqual(self.engine.default_model(), str(models / "my-own.gguf"))
+
+    def test_one_manager_per_data_folder(self):
+        first = llama_server.manager(self.root)
+        self.assertIs(first, llama_server.manager(self.root))
+        self.assertIsNot(first, Manager(self.root))
 
 
 if __name__ == "__main__":

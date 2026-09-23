@@ -60,6 +60,13 @@ class BM25Index:
             return 0.0
         return math.log(1.0 + (n - df + 0.5) / (df + 0.5))
 
+    def idf(self, term: str) -> float:
+        """Public wrapper so other modules can score loose term matches."""
+        return self._idf(term)
+
+    def vocabulary(self) -> Iterable[str]:
+        return self.postings.keys()
+
     def search(self, query: str, limit: int = 40) -> List[Tuple[str, float]]:
         """Return [(chunk_id, score)] sorted by descending BM25 score."""
         terms = tokenize(query)

@@ -23,15 +23,25 @@ DEFAULTS = {
     "max_context_chars": 7000,
     "mmr_lambda": 0.7,
     "rrf_k": 60.0,
+    # answer shaping (no-model mode)
+    "extractive_sentences": 5,
+    "closest_passages": 4,
+    "digest_sections": 10,
     # optional dense embeddings: auto | off | fastembed | sentence-transformers
     "embedding_backend": "auto",
     "embedding_model": "BAAI/bge-small-en-v1.5",
-    # language model: auto | llamacpp | server | extractive
+    # language model: auto | managed | llamacpp | server | extractive
+    #   managed  = the llama-server AURA downloads and runs itself (the default)
+    #   llamacpp = a .gguf through the optional llama-cpp-python package
+    #   server   = any OpenAI-compatible server you run yourself (Ollama, ...)
     "llm_backend": "auto",
     "llm_model_path": "",
     "llm_server_url": "http://127.0.0.1:8080/v1/chat/completions",
     "llm_max_tokens": 512,
     "llm_temperature": 0.2,
+    "llm_n_ctx": 4096,
+    "llm_threads": 0,
+    "llm_start_timeout_s": 120,
     # server
     "host": "127.0.0.1",
     "port": 8765,

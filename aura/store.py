@@ -95,22 +95,27 @@ class Library:
                 pass
 
     # ------------------------------------------------------------------ ingest
+    def _ingest(self, path: str | Path):
+        """Read a file and cut it into passages (no library mutation)."""
+        document, pages = ingest_file(path)
+        chunks = chunk_pages(
+            pages, document.doc_id, document.name,
+            target_chars=int(self.settings.get("chunk_chars", 900)),
+            overlap_chars=int(self.settings.get("chunk_overlap_chars", 150)),
+            min_chars=int(self.settings.get("min_chunk_chars", 120)))
+        if not chunks:
+            raise AuraError("no indexable text found in {}".format(document.name))
+        return document, chunks
+
     def add_file(self, path: str | Path, build_dense: Optional[bool] = None) -> Document:
         with self.lock:
-            document, pages = ingest_file(path)
+            document, new_chunks = self._ingest(path)
             existing = self.documents.get(document.doc_id)
             if existing is not None:
                 self._drop(existing.doc_id)
                 document.notes = list(document.notes)
                 document.notes.append("re-added (replaced the earlier copy)")
             document.added = datetime.datetime.now().isoformat(timespec="seconds")
-            new_chunks = chunk_pages(
-                pages, document.doc_id, document.name,
-                target_chars=int(self.settings.get("chunk_chars", 900)),
-                overlap_chars=int(self.settings.get("chunk_overlap_chars", 150)),
-                min_chars=int(self.settings.get("min_chunk_chars", 120)))
-            if not new_chunks:
-                raise AuraError("no indexable text found in {}".format(document.name))
             self.documents[document.doc_id] = document
             self.chunks.extend(new_chunks)
             self._rebuild_indexes(build_dense=build_dense)
@@ -167,6 +172,37 @@ class Library:
             self.save()
             return self.stats()
 
+    def reingest(self, build_dense: Optional[bool] = None) -> dict:
+        """Re-read every document from the file it came from.
+
+        Rebuilding the indexes only re-scores the passages that are already
+        stored, so this is the way to apply a changed chunker or a new ingest
+        backend to a library that was built by an older version. The stored
+        copy is replaced rather than duplicated when a file has changed.
+        """
+        with self.lock:
+            refreshed: List[str] = []
+            skipped: List[str] = []
+            for document in list(self.documents.values()):
+                path = str(document.path or "")
+                if not path or not Path(path).exists():
+                    skipped.append(document.name)
+                    continue
+                try:
+                    incoming, new_chunks = self._ingest(path)
+                except AuraError:
+                    skipped.append(document.name)
+                    continue
+                incoming.added = document.added or datetime.datetime.now().isoformat(timespec="seconds")
+                self._drop(document.doc_id)
+                self.documents[incoming.doc_id] = incoming
+                self.chunks.extend(new_chunks)
+                refreshed.append(incoming.name)
+            self._rebuild_indexes(build_dense=build_dense)
+            self.save()
+            return {"reingested": len(refreshed), "names": refreshed, "skipped": skipped,
+                    "stats": self.stats()}
+
     # ---------------------------------------------------------------- retrieval
     @property
     def retriever(self) -> Retriever:
@@ -180,9 +216,21 @@ class Library:
                 return []
             return self.retriever.search(query, k=int(k or self.settings.get("top_k", 6)))
 
+    def closest(self, query: str, k: Optional[int] = None) -> List[Hit]:
+        """Nearest passages when nothing matched the question directly."""
+        with self.lock:
+            if not self.chunks:
+                return []
+            return self.retriever.fallback(query, k=int(k or self.settings.get("top_k", 6)))
+
     def ask(self, question: str, k: Optional[int] = None, backend=None):
         hits = self.search(question, k=k)
-        return answer_question(question, hits, self.settings, backend=backend)
+        fallback = False
+        if not hits:
+            hits = self.closest(question, k=k)
+            fallback = bool(hits)
+        return answer_question(question, hits, self.settings, backend=backend,
+                               outline=self.chunks, fallback=fallback)
 
     # ------------------------------------------------------------------- info
     def stats(self) -> dict:

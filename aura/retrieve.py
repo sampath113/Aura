@@ -77,7 +77,50 @@ class Retriever:
             hit.label = "S{}".format(position)
         return selected
 
-    # ------------------------------------------------------------------- mmr
+    # -------------------------------------------------------------- fallback
+    def fallback(self, query: str, k: int = 6) -> List[Hit]:
+        """Best-effort "nearest passages" when nothing matched lexically.
+
+        A student who asks a question their notes do not literally contain
+        should still see the closest material rather than a blank refusal, so
+        this tries looser matches first (shared word stems/prefixes) and then
+        falls back to the opening passage of each document, which is where
+        overviews and definitions live.
+        """
+        if not self.chunks:
+            return []
+        k = max(1, int(k))
+        terms = [term for term in tokenize(query) if len(term) >= 4]
+        scored: Dict[str, float] = {}
+        for term in terms:
+            for vocabulary_term, postings in self.bm25.postings.items():
+                if vocabulary_term == term:
+                    continue
+                if not (vocabulary_term.startswith(term) or term.startswith(vocabulary_term)):
+                    continue
+                weight = self.bm25.idf(vocabulary_term)
+                for key in postings:
+                    chunk_id = self.bm25.chunk_ids[int(key)]
+                    scored[chunk_id] = scored.get(chunk_id, 0.0) + weight
+        ordered = sorted(scored.items(), key=lambda item: (-item[1], item[0]))[:k]
+        hits: List[Hit] = []
+        for chunk_id, score in ordered:
+            chunk = self.chunks.get(chunk_id)
+            if chunk is not None:
+                hits.append(Hit(chunk=chunk, score=score, bm25=score))
+        if not hits:
+            openings: Dict[str, Chunk] = {}
+            for chunk in self.chunks.values():
+                current = openings.get(chunk.doc_id)
+                if current is None or chunk.ordinal < current.ordinal:
+                    openings[chunk.doc_id] = chunk
+            for chunk in sorted(openings.values(), key=lambda item: item.ordinal)[:k]:
+                hits.append(Hit(chunk=chunk, score=0.0, bm25=0.0))
+        for position, hit in enumerate(hits, start=1):
+            hit.label = "S{}".format(position)
+        return hits
+
+    # ------------------------------------------------------------------ mmr
     def _mmr(self, candidates: List[Hit], k: int) -> List[Hit]:
         if len(candidates) <= k:
             return candidates
@@ -107,12 +150,15 @@ class Retriever:
         return [candidates[index] for index in chosen]
 
 
-def rank_sentences(question: str, hits: Sequence[Hit], limit: int = 6) -> List[tuple]:
+def rank_sentences(question: str, hits: Sequence[Hit], limit: int = 6,
+                   floor_ratio: float = 0.45) -> List[tuple]:
     """Pick the best supporting sentences from a set of hits.
 
     Used by the extractive answerer (and to sanity-check a generated answer):
     sentences are scored by coverage of the question's content words, weighted
-    by how rare those words are across the evidence.
+    by how rare those words are across the evidence. Sentences far weaker than
+    the best match are dropped so an answer is not padded with unrelated lines
+    that merely shared a common word.
     """
     from collections import Counter
     from .text import split_sentences
@@ -141,5 +187,10 @@ def rank_sentences(question: str, hits: Sequence[Hit], limit: int = 6) -> List[t
             score += 1.0 + (1.0 - document_frequency[word] / total)
         score /= (1.0 + 0.012 * max(0, len(sentence) - 220))
         scored.append((score, hit, sentence, start, end))
+    if not scored:
+        return []
     scored.sort(key=lambda item: -item[0])
-    return scored[:limit]
+    best = scored[0][0]
+    floor = best * max(0.0, min(1.0, floor_ratio))
+    kept = [item for item in scored if item[0] >= floor]
+    return kept[:limit]

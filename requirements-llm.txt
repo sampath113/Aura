@@ -1,13 +1,21 @@
-# A local language model, so AURA writes its own answers instead of extracting
-# sentences from your sources. Requires a .gguf model file, e.g. Qwen2.5-1.5B or
-# Qwen2.5-3B-Instruct from Hugging Face; then set the path in Settings
-# ("Path to a local .gguf model") or run:
-#     AURA.exe --ask "..." --help
+# Optional: the *alternative* way AURA can run a model.
 #
-# Wheels are published for Windows/Linux/macOS CPU builds:
+# AURA has two local backends. The default one is built in - it downloads the
+# official prebuilt llama.cpp `llama-server` and runs it as a child process
+# (see aura/llama_server.py), so there is nothing to install here.
+#
+# This file is for the other one: llama.cpp as a Python extension, which loads
+# the .gguf inside AURA's own process. It is only useful if you specifically
+# want that (no child process, or a llama-cpp-python build with hardware
+# acceleration), and it is why the package is not in requirements.txt.
+#
+#     pip install -r requirements-llm.txt
+#     # then set Settings -> "How answers are written" to `llamacpp`
+#
+# Wheels for CPU builds:
 #     pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
 #
-# Nothing else in AURA depends on this package, which keeps the desktop build
+# Nothing else in AURA depends on this package, which keeps the shipped build
 # small and dependency-free.
 
 llama-cpp-python>=0.2.79

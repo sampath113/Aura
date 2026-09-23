@@ -1,10 +1,15 @@
 """Language-model backends.
 
-Three ways to turn evidence into prose, in order of preference:
+Ways to turn evidence into prose, in order of preference:
 
-1. llama.cpp with a local GGUF (fully offline, no service to run)
-2. an OpenAI-compatible server on localhost (llama.cpp's own server, Ollama, ...)
-3. none - the extractive answerer in aura.answer takes over
+1. the llama-server that AURA downloads and runs itself (aura/llama_server.py) -
+   it speaks the OpenAI-compatible API below, so it needs no code here
+2. llama.cpp through the optional llama-cpp-python package, with a local GGUF
+3. an OpenAI-compatible server on localhost (Ollama, LM Studio, ...)
+4. none - the extractive answerer in aura.answer takes over
+
+`detect_backend` covers 2-4; the managed server in 1 is preferred by
+`aura.llama_server.backend_for()`, which is what the app actually calls.
 
 No backend is imported at module load, so the packaged app starts instantly and
 never depends on a C++ toolchain being present at build time.

@@ -5,6 +5,7 @@ const state = {
   docs: [],
   stats: {},
   settings: {},
+  model: {},
   answers: [],
   busy: false,
   libraryHidden: false,
@@ -108,7 +109,7 @@ function renderRich(text) {
     return value
       .replace(/`([^`]+)`/g, "<code>$1</code>")
       .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-      .replace(/_([^_]+)_/g, "<em>$1</em>")
+      .replace(/(^|[\s(])_([^_\n]{2,90})_(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
       .replace(/\[(S\d+)(?:\s*:\s*([^\]]+?))?\]/g, (match, label, rest) =>
         '<span class="cite" data-label="' + label + '" title="' + (rest || label) + '">' +
         label + "</span>");
@@ -169,24 +170,56 @@ async function loadHealth() {
   const health = await api("GET", "/health");
   state.settings = health.settings || {};
   state.stats = (health.stats || {});
-  el("backendPill").textContent = health.backend || "extractive";
-  el("backendPill").className = "pill" + (/extractive/.test(health.backend || "") ? "" : " good");
-  el("statusLine").textContent = health.app + " " + health.version + " - " +
-    (health.backend || "extractive") + " - " + (state.stats.root || "");
+  state.model = health.model || {};
+  const backend = health.backend || "extractive";
+  el("backendPill").textContent = backend;
+  el("backendPill").className = "pill" + (/extractive/.test(backend) ? "" : " good");
+  el("backendPill").title = state.model.detail || backend;
+  el("backendPill").onclick = openSettings;
+  const modelBit = state.model.state === "ready" ? " - local model ready"
+    : (state.model.state === "starting" ? " - local model loading"
+      : (state.model.state === "error" ? " - local model problem" : ""));
+  el("statusLine").textContent = health.app + " " + health.version + " - " + backend + modelBit +
+    " - " + (state.stats.root || "");
   renderStats();
 }
 
 /* ---------------------------------------------------------------------- ask */
+const MODE_LABELS = {
+  extractive: "quoted from your sources (no model)",
+  outline: "outline of your library (no model)",
+  closest: "closest passages (no direct match)",
+  "no-evidence": "nothing matched",
+  local: "written by your local model from your sources",
+  llamacpp: "local model",
+  server: "model server",
+};
+
+function modeLabel(mode) {
+  const key = String(mode || "extractive").split(" ")[0];
+  return MODE_LABELS[key] || mode;
+}
+
 function addMessage(role, html, meta) {
   const empty = el("emptyState");
   if (empty) empty.remove();
   const node = document.createElement("div");
   node.className = "msg " + role;
   node.innerHTML = '<div class="who">' + (role === "user" ? "You" : "AURA") + "</div>" +
-    '<div class="bubble">' + html + "</div>" + (meta ? '<div class="meta">' + meta + "</div>" : "");
+    '<div class="bubble">' + html + '</div><div class="meta">' + (meta || "") + "</div>";
   el("chatScroll").appendChild(node);
   el("chatScroll").scrollTop = el("chatScroll").scrollHeight;
   return node;
+}
+
+function setBubble(node, html) {
+  const bubble = node && node.querySelector(".bubble");
+  if (bubble) bubble.innerHTML = html;
+}
+
+function setMeta(node, html) {
+  const meta = node && node.querySelector(".meta");
+  if (meta) meta.innerHTML = html || "";
 }
 
 function sourcesHtml(hits) {
@@ -215,35 +248,45 @@ async function ask(question) {
   addMessage("user", escapeHtml(question));
   const pending = addMessage("aura",
     '<span class="thinking"><span class="dot"></span><span class="dot"></span>' +
-    '<span class="dot"></span> searching ' + (state.stats.chunks || 0) + " passages</span>");
+    '<span class="dot"></span><span class="thinkingText"> searching ' +
+    (state.stats.chunks || 0) + " passages</span></span>");
   let seconds = 0;
   const ticker = setInterval(() => {
     seconds += 1;
-    const bubble = pending.querySelector(".bubble");
-    if (bubble) bubble.lastChild.textContent = " searching and writing (" + seconds + "s)";
+    const label = pending.querySelector(".thinkingText");
+    if (label) label.textContent = " searching and writing (" + seconds + "s)";
   }, 1000);
   try {
     const payload = await api("POST", "/api/ask", { question });
     clearInterval(ticker);
     const checks = payload.checks || {};
-    const metaBits = ["mode: " + (payload.mode || "extractive"),
+    const mode = payload.mode || "extractive";
+    const metaBits = ["mode: " + modeLabel(mode),
                       "citations: " + ((payload.citations || []).length)];
-    if (checks.coverage !== undefined) metaBits.push("citation coverage: " + Math.round(checks.coverage * 100) + "%");
-    const warnings = (checks.notes || []).map((note) => '<span class="warn">' + escapeHtml(note) + "</span>");
-    pending.querySelector(".bubble").innerHTML = renderRich(payload.text || "");
-    pending.querySelector(".meta").innerHTML = metaBits.map(escapeHtml).join(" &middot; ") +
-      (warnings.length ? " &middot; " + warnings.join(" &middot; ") : "");
-    const sources = document.createElement("div");
-    sources.className = "msg aura";
-    sources.innerHTML = sourcesHtml(payload.hits);
-    pending.appendChild(sources);
+    if (checks.coverage !== undefined && mode !== "extractive" && mode !== "closest"
+        && mode !== "outline") {
+      metaBits.push("citation coverage: " + Math.round(checks.coverage * 100) + "%");
+    }
+    const warnings = (checks.notes || [])
+      .filter((note) => !(mode === "no-evidence" && /nothing matched/i.test(note)))
+      .map((note) => '<span class="warn">' + escapeHtml(note) + "</span>");
+    if (checks.fallback) warnings.unshift('<span class="warn">nearest passages, not a direct match</span>');
+    setBubble(pending, renderRich(payload.text || ""));
+    setMeta(pending, metaBits.map(escapeHtml).join(" &middot; ") +
+      (warnings.length ? " &middot; " + warnings.join(" &middot; ") : ""));
+    const sources = sourcesHtml(payload.hits);
+    if (sources) {
+      const node = document.createElement("div");
+      node.className = "msg aura";
+      node.innerHTML = sources;
+      pending.appendChild(node);
+    }
     wireCitations(pending);
     state.answers.push(payload);
   } catch (error) {
     clearInterval(ticker);
-    pending.querySelector(".bubble").innerHTML =
-      '<span class="warn">' + escapeHtml(error.message) + "</span>";
-    pending.querySelector(".meta").textContent = "";
+    setBubble(pending, '<span class="warn">' + escapeHtml(friendlyError(error)) + "</span>");
+    setMeta(pending, "");
   } finally {
     state.busy = false;
     el("askBtn").disabled = false;
@@ -263,25 +306,255 @@ function wireCitations(scope) {
   });
 }
 
+/* ------------------------------------------------------------------- models
+   The local model lives entirely on this machine: AURA downloads the model
+   file and llama.cpp's llama-server, then starts it and asks it to write the
+   answers. Nothing here needs an account, a key, or the internet afterwards.
+   --------------------------------------------------------------------------- */
+const modelState = { data: null, timer: null, error: "", test: null };
+
+async function refreshModels() {
+  try {
+    modelState.data = await api("GET", "/api/models");
+    modelState.error = "";
+  } catch (error) {
+    modelState.error = friendlyError(error);
+  }
+  renderModels();
+}
+
+function modelBusy() {
+  const data = modelState.data || {};
+  return Boolean((data.job && !data.job.done) || (data.engine && data.engine.state === "starting"));
+}
+
+function scheduleModelPoll() {
+  stopModelPoll();
+  const delay = modelBusy() ? 1200 : 6000;
+  modelState.timer = setTimeout(async () => {
+    modelState.timer = null;
+    if (!el("settingsSheet") || el("settingsSheet").hidden) return;
+    await refreshModels();
+    scheduleModelPoll();
+  }, delay);
+}
+
+function stopModelPoll() {
+  if (modelState.timer) {
+    clearTimeout(modelState.timer);
+    modelState.timer = null;
+  }
+}
+
+function jobCardHtml(job) {
+  if (!job) return "";
+  const tone = job.state === "error" ? " bad" : (job.state === "done" ? " good" : " warn");
+  const meta = job.state === "error" ? (job.error || "failed")
+    : (job.detail || job.state);
+  const bar = (job.state === "running" || job.state === "queued")
+    ? '<div class="bar"><i style="width:' + (job.percent || 0) + '%"></i></div>' : "";
+  const cancel = job.done ? ""
+    : '<button class="ghost small" data-model-action="cancel" data-job="' + job.id + '">Cancel</button>';
+  return '<div class="modelCard">' +
+    '<div class="modelRow"><div class="modelName">' + escapeHtml(job.label) + '</div>' +
+    '<div class="modelState' + tone + '">' + escapeHtml(job.percent + "% - " + job.state) + "</div></div>" +
+    bar + '<div class="modelMeta">' + escapeHtml(meta) + "</div>" +
+    (cancel ? '<div class="actions">' + cancel + "</div>" : "") + "</div>";
+}
+
+function modelSectionHtml() {
+  if (!modelState.data) {
+    return '<div class="field hint">' + escapeHtml(modelState.error || "Loading the model list...") + "</div>";
+  }
+  const data = modelState.data;
+  const engine = data.engine || {};
+  const eng = engine.engine || {};
+  const installed = data.installed || [];
+  const catalog = data.catalog || [];
+  const selected = data.selected || "";
+  const running = engine.state === "ready";
+  const downloading = modelBusy();
+  let html = "";
+
+  const tone = running ? "good" : (engine.state === "error" ? "bad" : "warn");
+  const headline = running ? "ready"
+    : (engine.state === "starting" ? "loading..."
+      : (engine.state === "error" ? "could not start"
+        : (selected ? "not running" : "no model chosen yet")));
+  html += '<div class="modelCard">' +
+    '<div class="modelRow"><div class="modelName">Local model</div>' +
+    '<div class="modelState ' + tone + '">' + escapeHtml(headline) + "</div></div>" +
+    '<div class="modelMeta">' + escapeHtml(engine.detail || "") + "</div>" +
+    (running ? '<div class="modelMeta">AURA writes its answers with this model, using the ' +
+      "passages it found in your own documents.</div>" : "") +
+    (running && engine.model_name
+      ? '<div class="modelMeta">' + escapeHtml(engine.model_name + " on " + engine.url) + "</div>" : "") +
+    (engine.log_tail ? '<pre class="modelLog">' + escapeHtml(engine.log_tail) + "</pre>" : "") +
+    '<div class="actions">' +
+    (running ? '<button class="ghost small" data-model-action="stop">Stop the model</button>' : "") +
+    (selected && !running ? '<button class="ghost small" data-model-action="start">Load the model</button>' : "") +
+    (selected ? '<button class="ghost small" data-model-action="test"' + (downloading ? " disabled" : "") +
+      ">Test the model</button>" : "") +
+    "</div></div>";
+
+  html += '<div class="modelCard">' +
+    '<div class="modelRow"><div class="modelName">Model engine</div>' +
+    '<div class="modelState ' + (engine.engine_installed ? "good" : "warn") + '">' +
+    (engine.engine_installed ? "installed" : "not installed") + "</div></div>" +
+    '<div class="modelMeta">' + (engine.engine_installed
+      ? escapeHtml("llama.cpp " + (eng.tag || "build") + " for " + (engine.platform || "") + " " +
+                   (engine.arch || "") + " (" + (eng.size || "") + " in " + (eng.folder || "") + ")")
+      : escapeHtml("AURA needs llama.cpp's llama-server to run a model. It is a " +
+                   (eng.download_mb || 18) + " MB download - no compiler, no extra software.")) + "</div>" +
+    '<div class="actions"><button class="ghost small" data-model-action="engine"' +
+    (downloading ? " disabled" : "") + ">" +
+    (engine.engine_installed ? "Reinstall the engine" : "Install the engine") + "</button></div></div>";
+
+  if (installed.length) {
+    html += '<div class="sectionTitle">Models on this machine</div>';
+    html += installed.map((item) => {
+      const isSelected = Boolean(selected) && item.path === selected;
+      const label = isSelected ? (running ? "in use" : "chosen") : "";
+      return '<div class="modelCard' + (isSelected ? " chosen" : "") + '">' +
+        '<div class="modelRow"><div class="modelName">' + escapeHtml(item.title) + "</div>" +
+        '<div class="modelState ' + (isSelected ? "good" : "") + '">' + escapeHtml(label) + "</div></div>" +
+        '<div class="modelMeta">' + escapeHtml(item.name) + " &middot; " + escapeHtml(item.size) +
+        (item.part ? " &middot; unfinished - download again to resume"
+                   : (item.known ? "" : " &middot; not from AURA's list")) + "</div>" +
+        '<div class="actions">' +
+        (item.part ? "" : '<button class="ghost small" data-model-action="use" data-path="' +
+          escapeHtml(item.path) + '">Use this</button>') +
+        '<button class="ghost small" data-model-action="remove" data-path="' +
+        escapeHtml(item.path) + '">Remove</button></div></div>';
+    }).join("");
+  }
+
+  html += '<div class="sectionTitle">Models AURA can download</div>';
+  html += catalog.map((model) => {
+    const ready = model.state === "ready";
+    const partial = !ready && model.on_disk > 0;
+    const status = ready ? (selected === model.path ? "chosen" : "downloaded") : (partial ? "unfinished" : "");
+    const meta = escapeHtml(model.params + " " + model.quant) + " &middot; " +
+      escapeHtml(model.size) + " &middot; about " + escapeHtml(String(model.ram_gb)) +
+      " GB of RAM &middot; " + escapeHtml(model.license);
+    return '<div class="modelCard' + (model.recommended ? " pick" : "") + '">' +
+      '<div class="modelRow"><div class="modelName">' + escapeHtml(model.name) +
+      (model.recommended ? ' <span class="tag">good first choice</span>' : "") + "</div>" +
+      '<div class="modelState ' + (ready ? "good" : "") + '">' + escapeHtml(status) + "</div></div>" +
+      '<div class="modelMeta">' + meta + "</div>" +
+      '<div class="modelMeta">' + escapeHtml(model.note) + "</div>" +
+      '<div class="actions">' +
+      (ready
+        ? '<button class="ghost small" data-model-action="use" data-path="' + escapeHtml(model.path) +
+          '">Use this</button>'
+        : '<button class="primary small" data-model-action="download" data-id="' + escapeHtml(model.id) +
+          '"' + (downloading ? " disabled" : "") + ">" +
+          (partial ? "Resume the download" : "Download " + escapeHtml(model.size)) + "</button>") +
+      "</div></div>";
+  }).join("");
+
+  if (data.job) html += jobCardHtml(data.job);
+
+  if (modelState.test) {
+    const ok = modelState.test.ok;
+    html += '<div class="modelCard">' +
+      '<div class="modelRow"><div class="modelName">Test result</div>' +
+      '<div class="modelState ' + (ok ? "good" : "bad") + '">' +
+      escapeHtml(modelState.test.seconds + "s") + "</div></div>" +
+      '<div class="modelMeta">' + escapeHtml(modelState.test.text || "the model said nothing back") + "</div>" +
+      '<div class="modelMeta">' + escapeHtml(modelState.test.backend || "") + "</div></div>";
+  }
+  if (modelState.error) {
+    html += '<div class="modelCard"><div class="modelMeta bad">' + escapeHtml(modelState.error) + "</div></div>";
+  }
+  return html;
+}
+
+function renderModels() {
+  const box = el("modelBox");
+  if (!box) return;
+  try {
+    box.innerHTML = modelSectionHtml();
+  } catch (error) {
+    box.innerHTML = '<div class="field hint bad">Could not show the model list (' +
+      escapeHtml(error.message) + ").</div>";
+  }
+}
+
+async function handleModelAction(button) {
+  const action = button.dataset.modelAction;
+  const restore = button.textContent;
+  button.disabled = true;
+  const wait = (label) => { button.textContent = label; };
+  try {
+    if (action === "download") {
+      wait("Starting...");
+      await api("POST", "/api/model/download", { id: button.dataset.id });
+      toast("Downloading - you can close Settings, it keeps going");
+    } else if (action === "engine") {
+      wait("Starting...");
+      await api("POST", "/api/engine/install", {});
+      toast("Installing the model engine...");
+    } else if (action === "use") {
+      wait("Switching...");
+      await api("POST", "/api/model/select", { path: button.dataset.path });
+      toast("AURA will use " + button.dataset.path.split(/[\\/]/).pop());
+      await loadHealth();
+    } else if (action === "remove") {
+      await api("POST", "/api/model/delete", { path: button.dataset.path });
+      toast("Removed " + button.dataset.path.split(/[\\/]/).pop());
+      await loadHealth();
+    } else if (action === "start") {
+      wait("Loading...");
+      await api("POST", "/api/model/start", {});
+      toast("Loading the model - this can take a few seconds");
+    } else if (action === "stop") {
+      await api("POST", "/api/model/stop", {});
+      toast("Local model stopped");
+      await loadHealth();
+    } else if (action === "cancel") {
+      await api("POST", "/api/jobs/" + button.dataset.job + "/cancel", {});
+      toast("Cancelling...");
+    } else if (action === "test") {
+      wait("Asking the model...");
+      modelState.test = await api("POST", "/api/model/test", {});
+      toast("The model answered in " + modelState.test.seconds + "s");
+      await loadHealth();
+    }
+    await refreshModels();
+  } catch (error) {
+    modelState.error = friendlyError(error);
+    toast(modelState.error, true);
+    await refreshModels();
+  } finally {
+    button.disabled = false;
+    button.textContent = restore;
+  }
+  scheduleModelPoll();
+}
+
 /* ----------------------------------------------------------------- settings */
 const SETTING_FIELDS = [
   ["top_k", "Passages given to the model", "number"],
   ["chunk_chars", "Passage size (characters)", "number"],
   ["chunk_overlap_chars", "Passage overlap", "number"],
-  ["llm_backend", "Language model backend", "select", ["auto", "llamacpp", "server", "extractive"]],
-  ["llm_model_path", "Path to a local .gguf model", "text"],
-  ["llm_server_url", "OpenAI-compatible server URL", "text"],
+  ["llm_backend", "How answers are written", "select",
+   ["auto", "managed", "llamacpp", "server", "extractive"]],
+  ["llm_model_path", "Model file AURA is using", "text"],
+  ["llm_n_ctx", "Model context size (tokens)", "number"],
+  ["llm_threads", "CPU threads for the model (0 = automatic)", "number"],
+  ["llm_server_url", "Or an OpenAI-compatible server URL", "text"],
   ["llm_max_tokens", "Max answer tokens", "number"],
   ["llm_temperature", "Temperature", "number"],
   ["embedding_backend", "Semantic search backend", "select", ["auto", "off", "fastembed", "sentence-transformers"]],
   ["embedding_model", "Embedding model", "text"],
 ];
 
-function openSettings() {
-  const body = el("settingsBody");
-  body.innerHTML = SETTING_FIELDS.map((field) => {
+function settingsFormHtml() {
+  const settings = state.settings || {};
+  const fields = SETTING_FIELDS.map((field) => {
     const [key, label, type, options] = field;
-    const value = state.settings[key];
+    const value = settings[key];
     if (type === "select") {
       return '<div class="field"><label>' + label + "</label><select data-key=\"" + key + "\">" +
         options.map((option) => '<option value="' + option + '"' +
@@ -290,12 +563,31 @@ function openSettings() {
     }
     return '<div class="field"><label>' + label + '</label><input data-key="' + key +
       '" type="' + type + '" value="' + escapeHtml(String(value === undefined ? "" : value)) + '"></div>';
-  }).join("") +
+  }).join("");
+  if (!fields) return '<div class="field hint">No settings could be built.</div>';
+  return '<div id="modelBox"><div class="field hint">Loading the model list...</div></div>' +
+    '<details class="adv"><summary>Retrieval, model size and advanced settings</summary>' +
+    '<div class="advBody">' + fields + "</div></details>" +
     '<button class="primary" id="saveSettingsBtn">Save settings</button>' +
-    '<div class="field hint">A .gguf model path needs llama-cpp-python installed. ' +
-    "Without a model AURA still answers by extracting sentences from your own sources.</div>";
+    '<div class="field hint">Saved settings apply from your next question - the model box ' +
+    "above saves itself as you press its buttons.</div>" +
+    '<div class="field"><button class="ghost" id="reingestBtn">Re-read my documents from disk</button>' +
+    '<div class="hint">Re-indexes every file in the library with the current version - ' +
+    "use it after updating AURA, or if a passage split looks wrong.</div></div>";
+}
 
-  el("saveSettingsBtn").onclick = async () => {
+function openSettings() {
+  const body = el("settingsBody");
+  if (!body) return;
+  try {
+    body.innerHTML = settingsFormHtml();
+  } catch (error) {
+    body.innerHTML = '<div class="field hint">Could not render the settings form (' +
+      escapeHtml(error.message) + ").</div>";
+  }
+
+  const saveBtn = el("saveSettingsBtn");
+  if (saveBtn) saveBtn.onclick = async () => {
     const payload = {};
     body.querySelectorAll("[data-key]").forEach((input) => {
       const key = input.dataset.key;
@@ -309,11 +601,32 @@ function openSettings() {
       await loadHealth();
     } catch (error) { toast(friendlyError(error), true); }
   };
+  const reingest = el("reingestBtn");
+  if (reingest) reingest.onclick = async () => {
+    const label = reingest.textContent;
+    reingest.disabled = true;
+    reingest.textContent = "Re-reading...";
+    try {
+      const result = await api("POST", "/api/reingest", {});
+      const skipped = (result.skipped || []).length;
+      toast("Re-read " + (result.reingested || 0) + " document(s)" +
+        (skipped ? " - " + skipped + " file(s) could not be found" : ""));
+      await loadLibrary();
+      await loadHealth();
+    } catch (error) {
+      toast(friendlyError(error), true);
+    } finally {
+      reingest.disabled = false;
+      reingest.textContent = label;
+    }
+  };
   el("settingsSheet").hidden = false;
   el("scrim").hidden = false;
+  refreshModels().then(() => scheduleModelPoll());
 }
 
 function closeSettings() {
+  stopModelPoll();
   el("settingsSheet").hidden = true;
   el("scrim").hidden = true;
 }
@@ -376,6 +689,16 @@ function wire() {
   el("settingsBtn").onclick = openSettings;
   el("closeSettingsBtn").onclick = closeSettings;
   el("scrim").onclick = closeSettings;
+  if (el("setupModelChip")) el("setupModelChip").onclick = openSettings;
+  el("settingsBody").addEventListener("click", (event) => {
+    const button = event.target.closest("[data-model-action]");
+    if (!button) return;
+    event.preventDefault();
+    handleModelAction(button);
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !el("settingsSheet").hidden) closeSettings();
+  });
   el("collapseBtn").onclick = () => {
     state.libraryHidden = !state.libraryHidden;
     document.querySelector(".layout").classList.toggle("solo", state.libraryHidden);

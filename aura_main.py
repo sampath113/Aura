@@ -23,6 +23,7 @@ if __package__ in (None, ""):  # running as a script / frozen exe
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aura import config           # noqa: E402
+from aura.llama_server import backend_for, manager  # noqa: E402
 from aura.llm import detect_backend  # noqa: E402
 from aura.models import AuraError  # noqa: E402
 from aura.server import create_server, lan_address  # noqa: E402
@@ -51,12 +52,28 @@ def parse_args(argv=None):
     parser.add_argument("--no-dense", action="store_true", help="disable semantic search for this run")
     parser.add_argument("--rebuild", action="store_true", help="rebuild the index before serving")
     parser.add_argument("--list", action="store_true", help="list the library and exit")
+    parser.add_argument("--model", default="", metavar="PATH",
+                        help="use this .gguf model (see --model-status)")
+    parser.add_argument("--model-status", action="store_true",
+                        help="show the local model and engine state, then exit")
+    parser.add_argument("--install-engine", action="store_true",
+                        help="download the llama.cpp engine AURA runs models with, then exit")
     return parser.parse_args(argv)
+
+
+def engine_line(library: Library) -> str:
+    """One honest sentence about what will write the answers."""
+    state = manager(library.root).status()
+    if state["state"] == "ready":
+        return "{} [started on port {}]".format(state["backend"] or state["model_name"], state["port"])
+    if state["model_name"] and state["state"] in ("starting", "error"):
+        return "{} [{}]".format(state["model_name"], state["detail"])
+    backend = detect_backend(library.settings)
+    return backend.describe() if backend else "extractive answerer (no local model configured)"
 
 
 def banner(library: Library, host: str, port: int, allow_lan: bool) -> None:
     stats = library.stats()
-    backend = detect_backend(library.settings)
     line = "-" * 66
     print(line)
     print("  {} {}  -  {}".format(config.APP_NAME, config.APP_VERSION, config.APP_TAGLINE))
@@ -64,8 +81,7 @@ def banner(library: Library, host: str, port: int, allow_lan: bool) -> None:
     print("  documents     : {}  ({} passages, {} of text)".format(
         stats["documents"], stats["chunks"], _human(stats["chars"])))
     print("  semantic      : {}".format(stats["dense"]))
-    print("  answer engine : {}".format(backend.describe() if backend else
-                                       "extractive (no local model configured)"))
+    print("  answer engine : {}".format(engine_line(library)))
     print("  library folder: {}".format(stats["root"]))
     print()
     print("  open this in your browser : http://{}:{}".format(
@@ -108,10 +124,19 @@ def main(argv=None) -> int:
         print("could not open the library: {}".format(exc))
         return 2
 
+    if args.model:
+        chosen = Path(args.model).expanduser()
+        if not chosen.exists():
+            print("no model file at {}".format(args.model))
+            return 2
+        library.settings = config.save_settings(
+            library.root, dict(library.settings, llm_model_path=str(chosen)))
+
     if not library.settings.get("llm_model_path"):
-        model = bundled_model()
-        if model:
-            library.settings = dict(library.settings, llm_model_path=model)
+        found = bundled_model() or manager(library.root).default_model()
+        if found:
+            library.settings = config.save_settings(
+                library.root, dict(library.settings, llm_model_path=found))
 
     if args.no_dense:
         library.settings = dict(library.settings, embedding_backend="off")
@@ -142,8 +167,37 @@ def main(argv=None) -> int:
         print("{} document(s), {} passages".format(len(library.documents), len(library.chunks)))
         return 0
 
+    if args.model_status:
+        state = manager(library.root).status()
+        engine = state["engine"]
+        print("model      : {} [{}]".format(state["model_name"] or "none selected", state["state"]))
+        print("detail     : {}".format(state["detail"]))
+        print("engine     : {}".format(
+            "installed ({}) - {}".format(engine.get("tag") or "llama.cpp", engine.get("binary") or "")
+            if state["engine_installed"] else
+            "not installed - run: AURA --install-engine"))
+        print("models dir : {}".format(state["models_dir"]))
+        if engine.get("wanted_asset"):
+            print("engine for : {} {} ({})".format(state["platform"], state["arch"], engine["wanted_asset"]))
+        print("data dir   : {}".format(state["root"]))
+        return 0
+
+    if args.install_engine:
+        print("downloading the local model engine (about 18 MB) ...")
+        try:
+            info = manager(library.root).install_runtime()
+        except AuraError as exc:
+            print("could not install the engine: {}".format(exc))
+            return 4
+        print("installed {} into {}".format(info.get("tag") or "llama.cpp", info.get("folder")))
+        return 0
+
     if args.ask:
-        answer = library.ask(args.ask, k=args.top_k or None, backend=detect_backend(library.settings))
+        engine = manager(library.root)
+        backend = backend_for(library.root, library.settings)
+        if backend is None and engine.model_path and engine.detail:
+            print("(the local model was not used: {})".format(engine.detail))
+        answer = library.ask(args.ask, k=args.top_k or None, backend=backend)
         print(answer.text)
         print()
         print("mode: {} | citations: {}".format(answer.mode, ", ".join(answer.citations) or "none"))

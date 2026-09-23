@@ -17,7 +17,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Optional
 
-from . import config
+from . import catalog, config
+from . import downloads
+from .jobs import Jobs
+from .llama_server import manager
 from .llm import backend_report, detect_backend
 from .models import AuraError
 from .store import Library
@@ -32,13 +35,31 @@ class Api:
     def __init__(self, library: Library, backend=None):
         self.library = library
         self._backend = backend
+        self.jobs = Jobs()
+        self.engine = manager(library.root)
         self.upload_dir = Path(library.root) / "uploads"
         self.upload_dir.mkdir(parents=True, exist_ok=True)
+        self._warm_up()
+
+    def _warm_up(self) -> None:
+        """Start the local model in the background so the first question is fast."""
+        if not self.engine.is_configured(self.library.settings):
+            return
+
+        def run():
+            try:
+                if self.engine.ensure(self.library.settings) is not None:
+                    self.refresh_backend()
+            except Exception:  # noqa: BLE001 - a cold model must never break startup
+                pass
+
+        threading.Thread(target=run, name="aura-warmup", daemon=True).start()
 
     @property
     def backend(self):
         if self._backend is None:
-            self._backend = detect_backend(self.library.settings)
+            managed = self.engine.backend()
+            self._backend = managed if managed is not None else detect_backend(self.library.settings)
         return self._backend
 
     def refresh_backend(self) -> None:
@@ -53,14 +74,43 @@ class Api:
             "stats": self.library.stats(),
             "backend": backend.describe() if backend is not None else "extractive answerer (no model)",
             "backends": backend_report(self.library.settings),
+            "model": self.engine.status(),
             "settings": self.library.settings,
         }
+
+    def _prepare_model(self) -> str:
+        """Make sure the local model is up, and say what happened.
+
+        The returned string is added to the answer's notes, so a student who
+        picked a model but got quoted sentences is told why (still loading,
+        engine missing, the model failed to start) instead of being left to
+        guess.
+        """
+        settings = self.library.settings
+        if not self.engine.is_configured(settings):
+            return ""
+        already_ready = self.engine.state == "ready"
+        try:
+            backend = self.engine.ensure(settings)
+        except AuraError as exc:
+            return str(exc)
+        if backend is None:
+            if self.engine.state == "error":
+                return self.engine.detail
+            return ""
+        self._backend = backend
+        if not already_ready:
+            return "started the local model ({:.1f}s to load)".format(self.engine.started_seconds)
+        return ""
 
     def ask(self, question: str, k: Optional[int] = None) -> dict:
         question = (question or "").strip()
         if not question:
             raise AuraError("ask a question first")
+        note = self._prepare_model()
         answer = self.library.ask(question, k=k, backend=self.backend)
+        if note:
+            answer.checks.setdefault("notes", []).append(note)
         return answer.as_dict()
 
     def add(self, path: str = "", folder: str = "") -> dict:
@@ -93,12 +143,178 @@ class Api:
             if key in config.DEFAULTS:
                 current[key] = value
         self.library.settings = config.save_settings(self.library.root, current)
-        if "llm_backend" in (payload or {}) or "llm_model_path" in (payload or {}):
+        backend_keys = ("llm_backend", "llm_model_path", "llm_server_url", "llm_n_ctx",
+                        "llm_threads", "embedding_backend", "embedding_model")
+        if any(key in (payload or {}) for key in backend_keys):
             self.refresh_backend()
+            chosen = str(self.library.settings.get("llm_model_path") or "")
+            if self.engine.model_path and self.engine.model_path != chosen:
+                self.engine.stop()
         return self.library.settings
+
+    # ------------------------------------------------------------------- models
+    def models_payload(self) -> dict:
+        settings = self.library.settings
+        folder = self.engine.models_dir()
+        return {
+            "catalog": [catalog.status_of(model, folder) for model in catalog.MODELS],
+            "installed": catalog.installed_files(folder),
+            "selected": str(settings.get("llm_model_path") or ""),
+            "engine": self.engine.status(),
+            "job": self.jobs.latest(("model", "engine")),
+            "jobs": self.jobs.list(("model", "engine")),
+            "settings": {key: settings.get(key) for key in (
+                "llm_backend", "llm_max_tokens", "llm_temperature", "llm_n_ctx",
+                "llm_threads", "llm_server_url")},
+            "platform": {"key": catalog.platform_key(), "arch": catalog.arch_key(),
+                         "asset": catalog.runtime_pattern()},
+            "default": catalog.recommended()["id"],
+        }
+
+    def model_download(self, model_id: str) -> dict:
+        model = catalog.entry(str(model_id or ""))
+        if model is None:
+            raise AuraError("I do not know a model called '{}'".format(model_id))
+        folder = self.engine.models_dir()
+
+        def work(job):
+            for item in model["files"]:
+                target = folder / item["name"]
+                if target.exists() and target.stat().st_size == item["bytes"]:
+                    continue
+                label = "downloading {}".format(item["name"])
+                job.set_progress(0, item["bytes"], label)
+
+                def on_progress(done, total, label=label):
+                    job.set_progress(done, total, label)
+
+                downloads.download(item["url"], target, expected_bytes=item["bytes"],
+                                   sha256=item["sha256"], on_progress=on_progress,
+                                   cancelled=job.cancelled)
+            path = str(folder / model["file"])
+            if not str(self.library.settings.get("llm_model_path") or ""):
+                self.update_settings({"llm_model_path": path})
+            result = {"model": model["id"], "path": path, "bytes": model["bytes"],
+                      "started": False, "engine_detail": ""}
+            if self.engine.engine_state()["installed"]:
+                job.detail = "loading the model (first load takes a few seconds) ..."
+                backend = self.engine.ensure(self.library.settings, force=True)
+                result["started"] = backend is not None
+                result["engine_detail"] = self.engine.detail
+            else:
+                result["engine_detail"] = ("the model is saved - now install the local model engine "
+                                           "so AURA can use it")
+            self.refresh_backend()
+            return result
+
+        job = self.jobs.run("model", "Download {}".format(model["name"]), work)
+        return {"job_id": job.id, "model": model["id"]}
+
+    def model_select(self, path: str) -> dict:
+        raw = str(path or "").strip()
+        if not raw:
+            self.update_settings({"llm_model_path": ""})
+            self.engine.stop()
+            return {"engine": self.engine.status(), "selected": ""}
+        target = Path(raw).expanduser()
+        if not target.exists():
+            raise AuraError("there is no file at {}".format(raw))
+        if target.suffix.lower() != ".gguf":
+            raise AuraError("AURA runs .gguf models, and {} is {}".format(
+                target.name, "a folder" if target.is_dir() else "not one"))
+        if self.engine.model_path and str(target) != self.engine.model_path:
+            self.engine.stop()
+        self.update_settings({"llm_model_path": str(target)})
+        return {"engine": self.engine.status(), "selected": str(target)}
+
+    def model_delete(self, path: str) -> dict:
+        target = Path(str(path or "")).expanduser()
+        folder = self.engine.models_dir().resolve()
+        try:
+            inside = target.resolve().parent == folder or folder in target.resolve().parents
+        except OSError:
+            inside = False
+        if not inside:
+            raise AuraError("only files inside {} can be removed from here".format(folder))
+        entry = catalog.for_filename(target.name)
+        victims = [folder / item["name"] for item in entry["files"]] if entry else [target]
+        doomed = {str(victim) for victim in victims}
+        selected = str(self.library.settings.get("llm_model_path") or "")
+        if selected in doomed or str(self.engine.model_path) in doomed:
+            self.engine.stop()
+            self.update_settings({"llm_model_path": ""})
+        removed = []
+        for victim in victims:
+            for candidate in (victim, victim.with_name(victim.name + ".part")):
+                if candidate.exists():
+                    try:
+                        candidate.unlink()
+                        removed.append(candidate.name)
+                    except OSError as exc:
+                        raise AuraError("could not delete {}: {}".format(candidate.name, exc))
+        if not removed:
+            raise AuraError("{} is not there any more".format(target.name))
+        return {"removed": removed, "models": self.models_payload()}
+
+    def model_start(self, path: str = "") -> dict:
+        settings = dict(self.library.settings)
+        chosen = str(path or settings.get("llm_model_path") or "")
+        if not chosen:
+            chosen = self.engine.default_model()
+        if not chosen:
+            raise AuraError("no model has been chosen yet - download one first")
+        if str(settings.get("llm_model_path") or "") != chosen:
+            settings = self.update_settings({"llm_model_path": chosen})
+
+        def work(job):
+            job.detail = "loading {}".format(Path(chosen).name)
+            self.engine.start(chosen, settings)
+            self.refresh_backend()
+            return self.engine.status()
+
+        job = self.jobs.run("engine", "Start the local model", work)
+        return {"job_id": job.id, "model": chosen}
+
+    def model_stop(self) -> dict:
+        return {"engine": self.engine.stop()}
+
+    def model_test(self) -> dict:
+        result = self.engine.test(self.library.settings)
+        self.refresh_backend()
+        return result
+
+    def engine_install(self) -> dict:
+        def work(job):
+            info = self.engine.install_runtime(job)
+            job.detail = "engine {} installed".format(info.get("tag") or "")
+            return info
+
+        job = self.jobs.run("engine", "Install the local model engine", work)
+        return {"job_id": job.id}
+
+    def jobs_payload(self) -> dict:
+        return {"jobs": self.jobs.list()}
+
+    def job(self, job_id: str) -> dict:
+        job = self.jobs.get(str(job_id or ""))
+        if job is None:
+            raise AuraError("no job called '{}'".format(job_id))
+        return {"job": job.as_dict()}
+
+    def job_cancel(self, job_id: str) -> dict:
+        job = self.jobs.get(str(job_id or ""))
+        if job is None:
+            raise AuraError("no job called '{}'".format(job_id))
+        return {"cancelled": job.cancel(), "job": job.as_dict()}
+
 
     def rebuild(self) -> dict:
         return {"stats": self.library.rebuild()}
+
+    def reingest(self) -> dict:
+        result = self.library.reingest()
+        return {"reingested": result.get("reingested", 0), "names": result.get("names", []),
+                "skipped": result.get("skipped", []), "stats": self.library.stats()}
 
     def documents(self) -> dict:
         return {"documents": self.library.document_list(), "stats": self.library.stats()}
@@ -187,6 +403,16 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/settings":
                 self._send_json({"settings": self.api.settings()})
                 return
+            if route == "/api/models":
+                self._send_json(self.api.models_payload())
+                return
+            if route == "/api/jobs":
+                self._send_json(self.api.jobs_payload())
+                return
+            if route.startswith("/api/jobs/"):
+                job_id = route.rsplit("/", 1)[-1]
+                self._send_json(self.api.job(job_id))
+                return
             if route.startswith("/api/document/"):
                 doc_id = route.rsplit("/", 1)[-1]
                 self._send_json({"removed": bool(self.api.library.remove(doc_id))})
@@ -245,6 +471,38 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if route == "/api/rebuild":
                 self._send_json(self.api.rebuild())
+                return
+            if route == "/api/reingest":
+                self._send_json(self.api.reingest())
+                return
+            if route == "/api/model/download":
+                self._send_json(self.api.model_download(self._decode_json(body).get("id", "")))
+                return
+            if route == "/api/model/select":
+                self._send_json(self.api.model_select(self._decode_json(body).get("path", "")))
+                return
+            if route == "/api/model/delete":
+                self._send_json(self.api.model_delete(self._decode_json(body).get("path", "")))
+                return
+            if route == "/api/model/start":
+                self._send_json(self.api.model_start(self._decode_json(body).get("path", "")))
+                return
+            if route == "/api/model/stop":
+                self._send_json(self.api.model_stop())
+                return
+            if route == "/api/model/test":
+                self._send_json(self.api.model_test())
+                return
+            if route == "/api/engine/install":
+                self._send_json(self.api.engine_install())
+                return
+            if route.startswith("/api/jobs/") and route.endswith("/cancel"):
+                job_id = route[len("/api/jobs/"):-len("/cancel")].strip("/")
+                self._send_json(self.api.job_cancel(job_id))
+                return
+            if route.startswith("/api/jobs/"):
+                job_id = route.rsplit("/", 1)[-1]
+                self._send_json(self.api.job(job_id))
                 return
             self._send_json({"error": "unknown route: {}".format(route)}, 404)
         except AuraError as exc:

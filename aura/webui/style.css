@@ -15,6 +15,10 @@
 
 * { box-sizing: border-box; }
 
+/* The sheet is display:flex below, and an author rule beats the browser's
+   [hidden] rule - without this the Settings panel is stuck open on load. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   height: 100%;
@@ -103,7 +107,9 @@ button.primary.big { padding: 12px 22px; }
 .msg.user { display: flex; flex-direction: column; align-items: flex-end; }
 .msg.user .bubble { max-width: 85%; }
 .meta { color: var(--muted); font-size: 12px; margin-top: 6px; display: flex; gap: 10px; flex-wrap: wrap; }
+.meta:empty { display: none; }
 .meta .warn { color: var(--warn); }
+.bubble .warn { color: var(--bad); }
 
 .cite {
   display: inline-block; font-size: 12px; padding: 1px 7px; margin: 0 2px;
@@ -154,6 +160,44 @@ button.primary.big { padding: 12px 22px; }
   padding: 10px 16px; border-radius: 10px; z-index: 40; font-size: 13px;
 }
 .toast.bad { border-color: #6b2a2a; background: #3a1c1c; }
+
+/* ------------------------------------------------------------------- models */
+.sectionTitle {
+  font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--muted); margin: 16px 0 8px;
+}
+.modelCard {
+  border: 1px solid var(--line); background: var(--bg2); border-radius: 10px;
+  padding: 10px 12px; margin-bottom: 9px;
+}
+.modelCard.chosen { border-color: #2a6b58; background: #14243c; }
+.modelCard.pick { border-color: #33509b; }
+.modelRow { display: flex; gap: 10px; align-items: baseline; justify-content: space-between; flex-wrap: wrap; }
+.modelName { font-weight: 600; font-size: 13.5px; word-break: break-word; flex: 1 1 auto; min-width: 0; }
+.modelMeta { color: var(--muted); font-size: 11.5px; margin-top: 3px; word-break: break-word; }
+.modelMeta.bad { color: var(--bad); }
+.modelState { font-size: 11.5px; color: var(--muted); white-space: nowrap; flex: 0 0 auto; }
+.modelState.good { color: var(--accent2); }
+.modelState.warn { color: var(--warn); }
+.modelState.bad { color: var(--bad); }
+.modelLog {
+  margin: 7px 0 0; padding: 7px 9px; max-height: 130px; overflow: auto;
+  background: #0c1224; border: 1px solid var(--line); border-radius: 8px;
+  color: var(--muted); font-size: 11px; white-space: pre-wrap; word-break: break-word;
+}
+.bar { height: 8px; background: #0c1224; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; margin: 7px 0 2px; }
+.bar > i { display: block; height: 100%; background: linear-gradient(90deg, #7ef0c4, #6ea8ff); transition: width 0.3s ease; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.actions button { white-space: nowrap; }
+button.ghost.small, button.primary.small { padding: 6px 10px; font-size: 12px; }
+button.primary.small { background: linear-gradient(135deg, #6ea8ff, #4d7fe0); color: #05112b; border: none; font-weight: 650; }
+.tag {
+  font-size: 10.5px; color: var(--accent2); border: 1px solid #2a6b58;
+  border-radius: 999px; padding: 1px 7px; margin-left: 5px; font-weight: 500;
+}
+details.adv { border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); padding: 9px 12px; margin-bottom: 12px; }
+details.adv summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+details.adv .advBody { margin-top: 12px; }
 
 @media (max-width: 860px) {
   .layout { grid-template-columns: 1fr; padding: 10px; }
