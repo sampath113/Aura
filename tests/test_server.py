@@ -414,6 +414,56 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertIn("only this machine", json.loads(body)["error"])
 
+    # ------------------------------------------------- where AURA is running
+    def test_host_endpoint_says_where_aura_is_running(self):
+        status, _headers, body = self.get("/api/host")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertFalse(payload["android"])
+        self.assertFalse(payload["picker"])
+        self.assertTrue(payload["can_read_files"])
+        self.assertEqual(payload["document_count"], 0)
+        self.assertEqual(payload["models_dir"], str(self.api.engine.models_dir()))
+        self.assertFalse(payload["engine"]["installed"])
+        self.assertFalse(payload["engine"]["bundled"])
+
+    def test_this_build_has_no_file_picker_of_its_own(self):
+        """The Android picker is reached from the page, not from Python."""
+        status, _headers, body = self.post("/api/pick", {"kind": "folder"})
+        self.assertEqual(status, 400)
+        self.assertIn("cannot open a file picker", json.loads(body)["error"])
+
+    # ---------------------------------------------------------- models folder
+    def test_the_models_folder_is_taken_only_if_it_can_be_written_to(self):
+        folder = Path(self.root) / "models-here"
+        status, _headers, body = self.post("/api/settings", {"models_dir": str(folder)})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["settings"]["models_dir"], str(folder))
+        self.assertTrue(folder.is_dir())
+
+    def test_a_models_folder_that_is_a_file_is_refused(self):
+        afile = Path(self.root) / "not-a-folder.txt"
+        afile.write_text("hello", encoding="utf-8")
+        status, _headers, body = self.post("/api/settings", {"models_dir": str(afile)})
+        self.assertEqual(status, 400)
+        self.assertIn("not a folder", json.loads(body)["error"])
+
+    def test_an_empty_models_folder_means_the_default(self):
+        status, _headers, body = self.post("/api/settings", {"models_dir": "   "})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["settings"]["models_dir"], "")
+
+    def test_models_endpoint_reports_where_the_files_go(self):
+        status, _headers, body = self.get("/api/models")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["folder"]["path"], str(self.api.engine.models_dir()))
+        self.assertEqual(payload["folder"]["default"], payload["folder"]["path"])
+        self.assertFalse(payload["folder"]["chosen"])
+        self.assertTrue(payload["folder"]["writable"])
+        self.assertIsNone(payload["bundle"])  # nothing is bundled into a desktop build
+        self.assertIn("models_dir", payload["settings"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

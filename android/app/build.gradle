@@ -1,17 +1,135 @@
+// ---------------------------------------------------------------------------
+// AURA for Android
+//
+// This module is a thin Java shell - a WebView, the system file picker, and the
+// "all files" permission - wrapped around the same Python program the desktop
+// build ships:
+//
+//   * Chaquopy puts CPython inside the APK and runs AURA from src/main/python,
+//     which is a byte-identical copy of the desktop tree (tools/sync_aura.py
+//     keeps it that way, and a test refuses to let the two drift apart);
+//   * AURA's own HTTP server then serves the same interface on 127.0.0.1, and
+//     the WebView shows it - one interface, one library format, one answer
+//     pipeline, on both platforms;
+//   * the llama.cpp engine cannot be downloaded at run time, because Android 10
+//     and later refuse to execute a file an app wrote into its own storage, so
+//     it is unpacked into the APK's native library directory *here*, at build
+//     time (see prepareAuraEngine below).
+//
+// Nothing in the engine step is required to run AURA. If the build machine is
+// offline, or GitHub is unreachable, the APK is still produced: AURA indexes,
+// searches and answers with quoted passages, and it says on screen that this
+// copy was built without the local model engine.
+// ---------------------------------------------------------------------------
+
 plugins {
     id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+// ---------------------------------------------------------------------------
+// The model engine
+// ---------------------------------------------------------------------------
+// The desktop build asks GitHub for the newest llama.cpp release; a phone
+// cannot, so this is pinned to one release whose contents are known to be laid
+// out the way the task below expects. Every file listed in `engineLibs` is also
+// listed in aura/catalog.py, and a test fails if the two lists ever disagree.
+def engineTag = "b11136"
+def engineArchiveName = "llama-${engineTag}-bin-android-arm64.tar.gz"
+def engineUrl = "https://github.com/ggml-org/llama.cpp/releases/download/${engineTag}/${engineArchiveName}"
+
+// llama.cpp's Android build is a seven-kilobyte launcher plus the real code in
+// shared objects. The launcher is the executable; Android only puts files named
+// lib*.so into the native library directory (the one place an app may execute
+// from), so it is renamed on the way in.
+def engineBinary = "libllama-server-bin.so"
+def engineLibs = [
+        "libllama-server-impl.so",
+        "libllama-common.so",
+        "libllama.so",
+        "libmtmd.so",
+        "libggml.so",
+        "libggml-base.so",
+        "libggml-cpu-android_armv8.0_1.so",
+        "libggml-cpu-android_armv8.2_1.so",
+        "libggml-cpu-android_armv8.2_2.so",
+        "libggml-cpu-android_armv8.6_1.so",
+        "libggml-cpu-android_armv9.0_1.so",
+        "libggml-cpu-android_armv9.2_1.so",
+        "libggml-cpu-android_armv9.2_2.so",
+]
+
+def engineRawDir = layout.buildDirectory.dir("engine/raw")
+def engineJniDir = layout.buildDirectory.dir("engine/jniLibs")
+def engineStamp = layout.buildDirectory.file("engine/engine.ok")
+
+// ---------------------------------------------------------------------------
+// Which Python
+// ---------------------------------------------------------------------------
+// The Chaquopy steps that need a Python on the build machine - installing the
+// packages below, compiling bytecode - insist that it has the same major.minor
+// version as the app. Rather than hard-code a version that only matches the
+// machine it was written on, ask the machine, and let an explicit
+// `-PbuildPython=/usr/bin/python3.12` override the probe.
+def supportedPython = ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+
+String pythonVersionOf(String exe) {
+    try {
+        def process = new ProcessBuilder(exe, "-c", "import sys; print('%d.%d' % sys.version_info[:2])")
+                .redirectErrorStream(true).start()
+        def text = process.inputStream.text.trim()
+        process.waitFor()
+        return (text ==~ /\d+\.\d+/) ? text : null
+    } catch (Exception ignored) {
+        return null
+    }
+}
+
+def detectBuildPython() {
+    def override = project.findProperty("buildPython")
+    if (override) {
+        def version = pythonVersionOf(override.toString())
+        if (version) {
+            return [override.toString(), version]
+        }
+        logger.warn("AURA: -PbuildPython=${override} is not a Python that runs; ignoring it")
+    }
+    for (String exe : ["python3", "python"]) {
+        def version = pythonVersionOf(exe)
+        if (version && supportedPython.contains(version)) {
+            return [exe, version]
+        }
+    }
+    return [null, null]
+}
+
+def detectedPython = detectBuildPython()
+def buildPythonExe = detectedPython[0]
+def pythonVersion = detectedPython[1] ?: "3.11"
+if (buildPythonExe == null) {
+    logger.warn("AURA: no Python 3.8-3.13 was found on this machine, so Chaquopy will look for ${pythonVersion} itself. "
+            + "If the build complains, pass -PbuildPython=/path/to/python3.11")
+} else {
+    logger.lifecycle("AURA: building against ${buildPythonExe} (Python ${pythonVersion})")
 }
 
 android {
-    namespace 'org.aura.pocket'
+    namespace 'org.aura.app'
     compileSdk 34
 
     defaultConfig {
-        applicationId 'org.aura.pocket'
+        applicationId 'org.aura.app'
         minSdk 26
         targetSdk 34
         versionCode 1
-        versionName '0.1.0'
+        versionName '1.0.0'
+
+        // The Python interpreter and the engine are both native code, and a
+        // 32-bit build would need a different engine. A phone that runs a
+        // multi-gigabyte model is a 64-bit one, so that is what this builds.
+        ndk {
+            abiFilters "arm64-v8a"
+        }
     }
 
     buildTypes {
@@ -26,8 +144,246 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
+    // The engine is an executable, and native libraries are only extracted (and
+    // therefore only executable) when they are stored uncompressed in the APK.
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
+
+    sourceSets {
+        main {
+            // Where prepareAuraEngine puts the engine. It does not exist in a
+            // fresh clone; the task creates it before anything is packaged.
+            jniLibs.srcDirs += [engineJniDir.get().asFile]
+        }
+    }
+
     lint {
         abortOnError false
         checkReleaseBuilds false
     }
+}
+
+chaquopy {
+    defaultConfig {
+        version = pythonVersion
+        if (buildPythonExe != null) {
+            buildPython(buildPythonExe)
+        }
+        pip {
+            // The three optional packages the desktop requirements.txt lists.
+            // AURA imports each one where it is used and falls back when it is
+            // absent (aura/ingest.py has a built-in PDF text scan and a DOCX
+            // reader for exactly this), so if a build machine cannot supply
+            // them, comment the line out and the app still reads everything -
+            // it just says in the document's notes which reader it used.
+            install "pypdf"
+            install "python-docx"
+            install "Pillow"
+        }
+    }
+    sourceSets {
+        getByName("main") {
+            // AURA itself: the same files as src/aura-app/aura.
+            srcDirs = ["src/main/python"]
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unpacking the engine into the APK
+// ---------------------------------------------------------------------------
+List<File> stripTools() {
+    def found = []
+    def onPath = { String name ->
+        def path = System.getenv("PATH") ?: ""
+        for (String entry : path.split(File.pathSeparator)) {
+            def candidate = new File(entry, name)
+            if (candidate.isFile() && candidate.canExecute()) {
+                return candidate
+            }
+        }
+        return null
+    }
+    // A host strip tool handles a foreign architecture perfectly well - it only
+    // rewrites the symbol and debug tables. Prefer llvm-strip, then the NDK's.
+    ["llvm-strip", "aarch64-linux-gnu-strip", "strip"].each { name ->
+        def exe = onPath(name)
+        if (exe != null) {
+            found << exe
+        }
+    }
+    [System.getenv("ANDROID_NDK_HOME"), System.getenv("ANDROID_NDK_ROOT")].each { ndk ->
+        if (ndk) {
+            def exe = new File(ndk, "toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip")
+            if (exe.isFile()) {
+                found << exe
+            }
+        }
+    }
+    def sdk = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
+    if (sdk) {
+        def ndkRoot = new File(sdk, "ndk")
+        if (ndkRoot.isDirectory()) {
+            (ndkRoot.listFiles() ?: []).each { version ->
+                def exe = new File(version, "toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip")
+                if (exe.isFile()) {
+                    found << exe
+                }
+            }
+        }
+    }
+    return found
+}
+
+boolean tryStrip(File tool, File file) {
+    try {
+        def process = new ProcessBuilder(tool.absolutePath, "--strip-unneeded", file.absolutePath)
+                .redirectErrorStream(true).start()
+        def text = process.inputStream.text
+        def code = process.waitFor()
+        if (code != 0) {
+            logger.lifecycle("AURA: ${tool.name} could not strip ${file.name}: ${text.trim()}")
+        }
+        return code == 0 && file.length() > 0L
+    } catch (Exception ignored) {
+        return false
+    }
+}
+
+/** Strip the debug information out of the engine, best effort and safely.
+ *
+ *  It is most of the download: the engine as published is about 230 MB, and
+ *  about 20 MB once stripped. Nothing here is worth failing a build over, so
+ *  every step works on a copy and is abandoned quietly if it does not work. */
+void stripEngine(File outDir, List<String> names) {
+    def tools = stripTools()
+    if (tools.isEmpty()) {
+        logger.lifecycle("AURA: no ELF strip tool on this machine - the engine keeps its debug "
+                + "information, and the APK will be a good deal larger")
+        return
+    }
+    def binary = new File(outDir, engineBinary)
+    for (File tool : tools) {
+        if (!binary.isFile()) {
+            return
+        }
+        def probe = new File(outDir, engineBinary + ".probe")
+        probe.bytes = binary.bytes
+        if (!tryStrip(tool, probe)) {
+            probe.delete()
+            continue
+        }
+        probe.delete()
+        logger.lifecycle("AURA: stripping the engine with ${tool}")
+        names.each { name ->
+            def target = new File(outDir, name)
+            if (!target.isFile()) {
+                return
+            }
+            def copy = new File(outDir, name + ".unstripped")
+            copy.bytes = target.bytes
+            if (tryStrip(tool, copy)) {
+                target.delete()
+                if (!copy.renameTo(target)) {
+                    copy.delete()
+                }
+            } else {
+                copy.delete()
+            }
+        }
+        return
+    }
+    logger.warn("AURA: none of the strip tools on this machine could strip the engine - it keeps "
+            + "its debug information and the APK will be a good deal larger")
+}
+
+tasks.register("prepareAuraEngine") {
+    description = "Unpacks the llama.cpp Android engine into the app's native libraries."
+    group = "aura"
+    outputs.dir(engineJniDir)
+    outputs.file(engineStamp)
+
+    doLast {
+        def stamp = engineStamp.get().asFile
+        if (stamp.isFile()) {
+            logger.lifecycle("AURA: the model engine is already unpacked")
+            return
+        }
+        try {
+            def rawDir = engineRawDir.get().asFile
+            def outDir = engineJniDir.get().asFile
+            def archive = new File(rawDir, engineArchiveName)
+
+            if (!archive.isFile() || archive.length() < 1000000L) {
+                logger.lifecycle("AURA: downloading the model engine (${engineArchiveName}, about 70 MB)")
+                rawDir.mkdirs()
+                def part = new File(rawDir, engineArchiveName + ".part")
+                part.delete()
+                new URL(engineUrl).withInputStream { input ->
+                    part.withOutputStream { output -> output << input }
+                }
+                if (!part.renameTo(archive)) {
+                    part.delete()
+                    throw new IOException("the downloaded archive could not be kept")
+                }
+            }
+
+            def unpacked = new File(rawDir, "unpacked")
+            unpacked.mkdirs()
+            project.ant.untar(src: archive, dest: unpacked, compression: "gzip", overwrite: true)
+            def sourceDir = null
+            unpacked.eachDirRecurse { dir ->
+                if (sourceDir == null && new File(dir, "llama-server").isFile()) {
+                    sourceDir = dir
+                }
+            }
+            if (sourceDir == null) {
+                throw new IOException("the archive did not contain llama-server")
+            }
+
+            def wanted = new LinkedHashMap<String, String>()
+            wanted["llama-server"] = engineBinary
+            engineLibs.each { name -> wanted[name] = name }
+
+            def missing = []
+            outDir.mkdirs()
+            wanted.each { from, to ->
+                def source = new File(sourceDir, from)
+                if (source.isFile()) {
+                    new File(outDir, to).bytes = source.bytes
+                } else {
+                    missing << from
+                }
+            }
+            if (missing) {
+                logger.warn("AURA: the engine archive was missing ${missing.join(', ')}")
+            }
+
+            stripEngine(outDir, new ArrayList<String>(wanted.values()))
+
+            stamp.parentFile.mkdirs()
+            stamp.text = "${engineTag}\n"
+            logger.lifecycle("AURA: the model engine is ready (${engineBinary})")
+        } catch (Exception error) {
+            logger.warn("AURA: could not prepare the model engine (${error}). The app will still "
+                    + "build: it will index, search and answer with quoted passages, but it will not "
+                    + "be able to run a local model - and it will say so on screen.")
+        }
+    }
+}
+
+def auraEngine = tasks.named("prepareAuraEngine")
+
+// The engine has to be in place before anything packages native libraries. The
+// task names are Android Gradle plugin internals, so both the specific ones and
+// the catch-all preBuild are wired up.
+tasks.matching { it.name.startsWith("merge") && (it.name.endsWith("JniLibFolders")
+        || it.name.endsWith("NativeLibs")) }.configureEach {
+    dependsOn(auraEngine)
+}
+tasks.named("preBuild") {
+    dependsOn(auraEngine)
 }

@@ -95,8 +95,6 @@ install can fetch everything itself.
 
 ---
 
-## 2. Smaller items
-
 ## 2. The desktop window - **BUILT** (2026-09-23)
 
 **Requested, verbatim:**
@@ -119,7 +117,7 @@ window is now `aura/desktop.py`:
 - [x] `--shell auto|webview|app|browser|none`, `--console`; `--no-browser` kept.
 - [x] `POST /api/quit` and `POST /api/open-browser` (loopback-only), surfaced as
       **Quit AURA** and **Open in my browser** in Settings -> *This window*,
-      which also shows the address and the AURA Pocket URL.
+      which also shows the address and the same-wifi URL.
 - [x] Single instance: launching AURA again opens the window of the AURA that is
       already serving (`aura_is_serving`).
 - [x] An icon: `aura.ico` (16-256px, embedded by the spec) and
@@ -159,7 +157,79 @@ window is now `aura/desktop.py`:
       likeliest) and whether the engine had just been installed when it
       appeared.
 
-## 4. Smaller items
+## 4. AURA on Android - **BUILT** (2026-09-23)
+
+**Requested, verbatim:**
+
+> why is the built app only 13.7kb.. port the windows app which we currently build
+> to android exactly as it is but made for mobile aspect ratios and the same mobile
+> selection but should as for permission to access files and a path to store the
+> downloaded models
+
+The 13.7 KB was the old *Android debug APK*: a one-screen connection dialog that
+pointed a WebView at a desktop AURA on the same wifi. It is gone. The
+phone app is now **AURA itself** - the same Python, the same retrieval, the same
+interface, the same model list - running on the device.
+
+- [x] **`aura/host.py`** - the one place that asks what machine this is (the Android
+      flag, the app's paths, the "all files" grant, the native library directory).
+      Every answer can be overridden from the environment, which is what makes a
+      phone testable with no phone present. Nothing else in `aura/` tests for Android.
+- [x] **`aura_mobile.py`** - the Android entry point: takes the app's paths as one
+      JSON blob, writes the first-run settings (models folder, thread count), serves
+      the interface on `127.0.0.1`, unloads the model 25 s after the app leaves the
+      screen, and answers the app's `foreground`/`background`/`shutdown` calls.
+- [x] **Chaquopy inside the APK** - `android/app/build.gradle` runs CPython in the
+      app, from `android/app/src/main/python/aura` (a byte-identical copy of `aura/`,
+      kept equal by `tools/sync_aura.py` and enforced by `AndroidMirrorTests`), and
+      installs the same three optional packages `requirements.txt` lists. Each has a
+      built-in fallback in `aura/ingest.py`, so a build machine that cannot supply
+      them loses nothing but the better readers.
+- [x] **The local model, on the phone** - the llama.cpp Android engine is unpacked
+      into the APK's native libraries at build time (`prepareAuraEngine`), renamed to
+      `libllama-server-bin.so` because Android only extracts `lib*.so` from there,
+      and stripped (230 MB -> ~20 MB). It is bundled rather than downloaded because
+      Android 10+ will not execute a file the app wrote itself. If the build machine
+      cannot reach GitHub, the APK still builds and says on screen that it has no
+      engine.
+- [x] **Files** - `MANAGE_EXTERNAL_STORAGE` (plus `READ_EXTERNAL_STORAGE` for older
+      Android), a first-run screen and a Settings nudge that offer the tap that grants
+      it, the system picker for "add files"/"add a folder", and a copy-into-the-app
+      fallback for a picked file with no real path.
+- [x] **A path for downloaded models** - `models_dir` is a real setting, defaulting to
+      `<shared storage>/models`, validated server-side (`POST /api/settings` refuses a
+      folder it cannot write to) and changeable from the model card with a native
+      folder picker. The model list, the download job and the progress bar are the
+      desktop ones.
+- [x] **Mobile layout** - a phone block in `webui/style.css` (bigger touch targets,
+      full-width sheets, stacked rows), the interface says "on this phone" instead of
+      "this machine", the paste-a-path row and the drop zone are hidden where there is
+      no filesystem to drop onto, and Quit/Open-in-browser behave as they can.
+- [x] **Lifecycle** - the model is unloaded when the app goes to the background, the
+      server stops when it is closed, and a leftover engine from a run Android killed
+      is reaped at the next start (`_reap_orphans`, which kills only this app's own
+      engine).
+- [x] **Tests** - 163 in the suite, including the Android paths, the bundled-engine
+      report (present / half-copied / absent), the reap rules, the first-run defaults,
+      `/api/host`, the models-folder validation, the build script's engine list and
+      the mirror. See `android/README.md` for how to build it.
+
+**Still open, and honest about it:**
+
+- [ ] **No device has run this yet.** The layout, the permission flow and the engine
+      launch are all reasoned and tested as far as they can be without hardware; a
+      first build on a real phone is the next step, and `android/README.md` lists
+      exactly what to check.
+- [ ] 64-bit only (`arm64-v8a`). A 32-bit phone would need the armeabi-v7a engine and
+      a second ABI in `abiFilters`.
+- [ ] Executing the engine from the native library directory is the standard trick for
+      this, but it is the one thing a strict device or SELinux policy can refuse; the
+      log tail is shown in the model card when it does.
+- [ ] An in-process backend (llama.cpp through JNI) would remove the child process and
+      the exec-from-lib question entirely. Much bigger job; not needed unless a device
+      turns out to refuse the current one.
+
+## 5. Smaller items
 
 - [ ] Definition bias in `rank_sentences` (`aura/retrieve.py`): for "what is X"
       questions, prefer sentences where a query term is followed by
@@ -168,6 +238,5 @@ window is now `aura/desktop.py`:
 - [ ] The document list's passage count and the header pill come from two
       different endpoints; a snapshot taken mid-ingest can show them disagreeing
       for one refresh. Re-read once after an ingest settles.
-- [ ] Android stays a client of the desktop engine. An on-device model is a
-      separate project (and the managed-engine design would not port to it
-      unchanged).
+- [x] Android was a client of the desktop engine; it is now the same app with the
+      engine bundled into the APK (see section 4).

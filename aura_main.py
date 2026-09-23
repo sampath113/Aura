@@ -5,13 +5,13 @@
     AURA.exe --shell browser           ... or in your browser instead
     AURA.exe --add notes.pdf          add documents, then start
     AURA.exe --ask "what is ATP?"     answer one question and exit
-    AURA.exe --lan                    also let your phone connect (AURA Pocket)
+    AURA.exe --lan                    also let other devices on your wifi connect
 
 The app is a small local server plus a single-page UI, which is what lets the
-same interface serve the desktop window and the AURA Pocket Android app. On the
-desktop the UI is shown in a native window (`aura/desktop.py`), falling back to
-a chromeless browser app window and then to a browser tab, so there is still no
-GUI toolkit to install.
+same interface serve the desktop window, the Android app and any browser on the
+network. On the desktop the UI is shown in a native window (`aura/desktop.py`),
+falling back to a chromeless browser app window and then to a browser tab, so
+there is still no GUI toolkit to install.
 """
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def parse_args(argv=None):
     parser.add_argument("--host", default="", help="bind address (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=0, help="port (default 8765, auto-advances if busy)")
     parser.add_argument("--lan", action="store_true",
-                        help="allow other devices on your network (the AURA Pocket app) to connect")
+                        help="allow other devices on your network to open this AURA")
     parser.add_argument("--shell", default="auto", choices=["auto", "webview", "app", "browser", "none"],
                         help="how to show the interface: auto (native window), webview, app "
                              "(chromeless browser window), browser, or none")
@@ -100,7 +100,7 @@ def banner(library: Library, host: str, port: int, allow_lan: bool) -> None:
         "127.0.0.1" if host in ("0.0.0.0", "") else host, port))
     if allow_lan:
         print("  phone (same wifi) : http://{}:{}".format(lan_address(), port))
-        print("                              paste that into AURA Pocket")
+        print("                              open that in a browser on your phone")
     else:
         print("  phone access  : off (start with --lan to allow it)")
     print("  stop AURA     : the Quit button in Settings, or Ctrl+C")

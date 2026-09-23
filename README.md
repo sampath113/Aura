@@ -55,7 +55,10 @@ aura/
   store.py              the Library: persistence + orchestration
   server.py             local HTTP API + static UI host
   webui/                the single-page interface (served by server.py)
-android/                AURA Pocket - the phone client (Gradle project)
+android/                the Android app - the same AURA, as an APK (Gradle project)
+  README.md             how the phone build works, and what a device can do to it
+  app/src/main/python/  a byte-identical copy of aura/, kept in step by tools/sync_aura.py
+  app/src/main/java/    the WebView, the system file picker, the permission
 tests/test_aura.py      dependency-free test suite
 tests/test_server.py    the HTTP layer, through a fake socket
 ```
@@ -250,13 +253,46 @@ the model invents is stripped before you see it.
 * Quitting over HTTP (`POST /api/quit`) and opening the real browser
   (`POST /api/open-browser`) are **loopback-only**; a phone on the same wifi may
   ask for anything else but not those two.
+* **The Android copy of `aura/` must stay identical** to this one
+  (`python android/tools/sync_aura.py`); `AndroidMirrorTests` fails otherwise, and a
+  phone quietly running older code is the one bug nobody would notice from here.
+* **`abiFilters` and the engine go together**: the engine names in
+  `android/app/build.gradle` (`engineLibs`) must match `ENGINE_BUNDLE_FILES` in
+  `aura/catalog.py` (a test enforces it), and `useLegacyPackaging = true` is what
+  makes the native library directory contain a file that can actually be executed.
+  Turn it off and the engine silently stops existing on the device.
+* On Android the engine is **bundled, not downloaded** (`host.is_android()`), so
+  nothing may assume it can be installed later: `install_runtime()` refuses, the
+  model card hides the button, and the "engine missing" sentence must not tell a
+  phone user to look for a Settings button that cannot exist.
+* **A kill does not reach the engine.** Android kills a backgrounded app, and
+  `llama-server` survives it, so the next start reaps it (`_reap_orphans`) — and
+  only it: another app's copy of the same binary, or any process that merely
+  mentions it, is left alone.
 
-## The phone client (AURA Pocket)
+## AURA on Android
 
-`../android/` is a Gradle project. It bundles one screen - a connection dialog -
-and then loads **the same web UI** from the AURA server on your local network, so
-there is only ever one interface to maintain. Start the desktop app with `--lan`,
-read the printed URL (`http://192.168.x.x:8765`), type it into the app once.
+`android/` is a Gradle project that builds **AURA itself** for a phone - the same
+program, the same interface, the same library, answering on the device with no
+desktop anywhere. It is not a remote control for the desktop app; it is the app.
+
+* **Chaquopy** puts CPython inside the APK and runs `aura/` from
+  `android/app/src/main/python/` (a byte-identical copy of `aura/` — `sync_aura.py`
+  keeps it that way and a test refuses to let them drift apart).
+* AURA's own server then serves the same interface on `127.0.0.1`, and the app's
+  WebView shows it. So there is still only one interface to maintain.
+* The **local model works on the phone**: llama.cpp's Android engine is unpacked
+  into the APK's native libraries at build time (Android 10+ will not execute a file
+  an app downloaded into its own storage), and models are downloaded from inside the
+  app into a folder the user picks — the same model list, the same Settings card.
+* **Files:** the app asks for the "all files" access a file manager asks for, so
+  AURA can be asked about the user's own PDFs and folders; a file picked from a
+  provider with no real path is copied into the app so it stays readable. Settings
+  shows where models go and offers a native folder picker to change it.
+
+Details, including the parts a real device can still surprise you with, are in
+`android/README.md`. The desktop app can also serve a phone on the same wifi with
+`--lan`, which is useful for a quick look but is not what the APK is for.
 
 ## Building the installers
 
@@ -269,6 +305,13 @@ and its Colab build server:
 * any directory holding `settings.gradle` is treated as the Android project - here `android/`;
 * `aura.spec` is picked up automatically, which is what bundles `aura/webui` into `AURA.exe`,
   collects pywebview and its WebView2 bindings when pywebview is installed, and embeds `aura.ico`.
+
+The Android target builds `android/` with Gradle 8.7 + AGP 8.6.1 + Chaquopy 16.1.0
+(all resolvable from Maven Central), a Python 3.8–3.13 on the build machine for
+Chaquopy's pip step, and llama.cpp's Android engine downloaded into the APK. It is
+the one target with a **release variant worth asking for** — a debug APK is slower
+and larger — and the one whose failure modes are worth reading about in
+`android/README.md` before believing a green build.
 
 The spec treats pywebview as optional on purpose: `Analysis` is built from
 `hiddenimports`/`datas` that are only added when `import webview` succeeds, so a
@@ -320,6 +363,15 @@ the small definition-bias tweak to sentence ranking.
 * With no model at all, answers are quoted sentences rather than prose, and a
   question your material does not cover gets the closest passages plus a note
   saying so - it never invents an answer, so "no direct match" is a real outcome.
-* The Android app is a client for the desktop engine, not an on-device model.
-  Running a quantised LLM natively on Android would be the next step, and it is
-  deliberately out of scope here.
+* On a phone the engine that runs the model arrives **inside the APK** (Android
+  will not execute a file the app downloaded itself), so the APK is tens of
+  megabytes and it is built for 64-bit devices only (`arm64-v8a`). If a build
+  machine cannot reach GitHub, the APK still works and says that it was built
+  without the engine.
+* Executing the engine from the app's native library directory is the standard
+  answer to that Android rule, but it is the one thing here that a strict device
+  or SELinux policy can refuse; `android/README.md` says where to look when that
+  happens.
+* The "all files" permission the phone app asks for is the one Google Play
+  restricts to file managers, so the APK is for sideloading. AURA also works
+  without the grant: files added through the picker are copied into the app.

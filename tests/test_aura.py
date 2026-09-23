@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import importlib.util
+import json
 import os
 import struct
 import sys
@@ -18,7 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aura import catalog, desktop, downloads, llama_server  # noqa: E402
+from aura import catalog, config, desktop, downloads, host, llama_server  # noqa: E402
 from aura.answer import (answer_question, build_digest, compose_closest, compose_extractive,  # noqa: E402
                          verify_answer, wants_overview)
 from aura.chunk import chunk_pages  # noqa: E402
@@ -477,6 +479,182 @@ class CatalogTests(unittest.TestCase):
             self.assertIsNone(catalog.find_binary(folder / "nowhere"))
 
 
+class HostTests(unittest.TestCase):
+    """Which machine AURA thinks it is on, and where it is allowed to write.
+
+    Every answer here comes from the environment rather than from the platform,
+    which is what makes a phone's behaviour checkable with no phone present: the
+    Android layer sets these variables before AURA starts.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.storage = self.base / "sdcard"
+        self.storage.mkdir()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def android_env(self, info=None, **env):
+        payload = {"storage_root": str(self.storage), "permission": "all",
+                   "app_version": "1.0.0", "api_level": 34}
+        payload.update(info or {})
+        environment = {"AURA_ANDROID": "1", "AURA_ANDROID_INFO": json.dumps(payload)}
+        environment.update(env)
+        return environment
+
+    def test_android_is_recognised_three_different_ways(self):
+        self.assertTrue(host.is_android({"AURA_ANDROID": "1"}))
+        self.assertTrue(host.is_android({"AURA_ANDROID": "true"}))
+        self.assertFalse(host.is_android({"AURA_ANDROID": "0"}, uname="Linux 6.1"))
+        self.assertTrue(host.is_android({}, uname="Linux version 5.10 (Android)"))
+        self.assertFalse(host.is_android({}, uname="Linux 6.1.0-generic"))
+        self.assertFalse(host.is_android({}, uname="Darwin"))
+
+    def test_the_app_hands_aura_its_paths(self):
+        env = self.android_env(AURA_DATA_DIR="/data/app/aura",
+                               AURA_MODELS_DIR=str(self.storage / "models"),
+                               AURA_NATIVE_LIB_DIR="/data/app/lib/arm64",
+                               AURA_WEBUI_DIR="/data/app/webui")
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertTrue(host.is_android())
+            self.assertEqual(host.platform_key(), "android")
+            self.assertEqual(host.platform_label(), "Android")
+            self.assertEqual(host.data_dir_env(), "/data/app/aura")
+            self.assertEqual(host.webui_dir(), "/data/app/webui")
+            self.assertEqual(host.native_lib_dir(), "/data/app/lib/arm64")
+            self.assertEqual(host.storage_root(), str(self.storage))
+            self.assertEqual(host.storage_permission(), "all")
+            self.assertTrue(host.can_read_files())
+            self.assertEqual(host.api_level(), 0)  # CPython only defines this on Android
+            self.assertEqual(host.default_models_dir(), str(self.storage / "models"))
+            described = host.describe(bundled_engine=True)
+            self.assertTrue(described["android"])
+            self.assertTrue(described["picker"])
+            self.assertTrue(described["bundled_engine"])
+            self.assertEqual(described["app_version"], "1.0.0")
+
+    def test_without_the_permission_only_the_app_folder_is_reachable(self):
+        env = self.android_env(info={"permission": "app"})
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertFalse(host.can_read_files())
+            self.assertEqual(host.storage_permission(), "app")
+            self.assertEqual(host.default_models_dir(), str(self.storage / "models"))
+
+    def test_a_desktop_has_no_picker_and_no_storage_root(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(host.is_android())
+            self.assertTrue(host.can_read_files())
+            self.assertNotEqual(host.platform_key(), "android")
+            self.assertEqual(host.storage_root(), "")
+            self.assertEqual(host.default_models_dir(), "")
+            self.assertEqual(host.external_roots(), [])
+            self.assertFalse(host.describe()["picker"])
+
+    def test_models_go_where_the_user_said_else_the_environment_else_the_library(self):
+        root = self.base / "data"
+        chosen = self.base / "chosen"
+        self.assertEqual(config.models_dir_for(root, {"models_dir": str(chosen)}), chosen)
+        self.assertTrue(chosen.is_dir())
+        self.assertEqual(config.models_dir_for(root, {}), root / "models")
+        with mock.patch.dict(os.environ, {"AURA_MODELS_DIR": str(self.base / "from-env")}, clear=True):
+            self.assertEqual(config.models_dir_for(root, {}), self.base / "from-env")
+            self.assertEqual(config.models_dir_for(root, {"models_dir": str(chosen)}), chosen)
+
+    def test_the_data_directory_falls_back_to_the_phones_storage(self):
+        env = self.android_env()
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(config.data_dir(), self.storage / host.ANDROID_APP_DIR_NAME)
+            self.assertTrue(config.data_dir().is_dir())
+        explicit = self.base / "explicit"
+        env = self.android_env(AURA_DATA_DIR=str(explicit))
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(config.data_dir(), explicit)
+
+
+class BundledEngineTests(unittest.TestCase):
+    """The engine that ships inside the Android app.
+
+    A phone cannot download an executable and run it (Android 10 and later
+    refuse to execute a file an app wrote into its own storage), so the engine
+    is unpacked into the APK's native libraries at build time and simply found
+    here. Everything below is about that path being honest when the build did
+    not manage to include it.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.libdir = self.base / "native" / "arm64"
+        self.libdir.mkdir(parents=True)
+        for name in catalog.ENGINE_BUNDLE_FILES:
+            (self.libdir / name).write_bytes(b"\x7fELF fake")
+
+    def tearDown(self):
+        llama_server.reset()
+        self.temp.cleanup()
+
+    def on_a_phone(self, folder=None):
+        return mock.patch.object(host, "is_android", return_value=True), \
+            mock.patch.object(host, "native_lib_dir", return_value=str(folder or self.libdir))
+
+    def test_the_engine_inside_the_app_is_the_one_that_runs(self):
+        android, folder = self.on_a_phone()
+        with android, folder:
+            self.assertTrue(catalog.is_bundled_engine())
+            self.assertEqual(catalog.binary_name(), catalog.BUNDLED_ENGINE_BINARY)
+            self.assertIn(catalog.BUNDLED_ENGINE_BINARY, catalog.BINARY_NAMES)
+            report = catalog.bundled_engine_report()
+            self.assertTrue(report["binary_present"])
+            self.assertTrue(report["installed"])
+            self.assertTrue(report["complete"])
+            self.assertEqual(report["missing"], [])
+            self.assertEqual(report["expected"], list(catalog.ENGINE_BUNDLE_FILES))
+
+    def test_a_half_copied_engine_is_not_offered_as_runnable(self):
+        (self.libdir / "libggml.so").unlink()
+        android, folder = self.on_a_phone()
+        with android, folder:
+            report = catalog.bundled_engine_report()
+            self.assertTrue(report["binary_present"])
+            self.assertFalse(report["installed"])
+            self.assertFalse(report["complete"])
+            self.assertEqual(report["missing"], ["libggml.so"])
+
+    def test_a_build_with_no_engine_at_all_says_so(self):
+        empty = self.base / "empty"
+        empty.mkdir()
+        android, folder = self.on_a_phone(empty)
+        with android, folder:
+            report = catalog.bundled_engine_report()
+            self.assertFalse(report["binary_present"])
+            self.assertFalse(report["installed"])
+            self.assertEqual(len(report["missing"]), len(catalog.ENGINE_BUNDLE_FILES))
+
+    def test_a_phone_has_no_engine_to_install(self):
+        android, folder = self.on_a_phone()
+        with android, folder:
+            engine = Manager(self.base / "data")
+            state = engine.engine_state()
+            self.assertTrue(state["bundled"])
+            self.assertTrue(state["installed"])
+            self.assertEqual(state["download_mb"], 0)
+            self.assertEqual(state["wanted_asset"], "built into the app")
+            self.assertIn("bundled", state["tag"])
+            with self.assertRaises(AuraError) as caught:
+                engine.install_runtime()
+            self.assertIn("built into this app", str(caught.exception))
+
+    def test_the_two_kinds_of_missing_engine_read_differently(self):
+        phone = llama_server._engine_missing_message({"bundled": True}, "qwen.gguf")
+        self.assertIn("built without the local model engine", phone)
+        self.assertNotIn("Settings", phone)
+        desktop = llama_server._engine_missing_message({"bundled": False, "download_mb": 18}, "qwen.gguf")
+        self.assertIn("local model engine is not", desktop)
+        self.assertIn("Settings", desktop)
+
+
 class ModelFileTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -898,7 +1076,7 @@ class EngineTests(unittest.TestCase):
     def test_default_model_prefers_what_is_already_there(self):
         self.assertEqual(self.engine.default_model(), "")
         models = self.engine.models_dir()
-        models.mkdir(parents=True)
+        models.mkdir(parents=True, exist_ok=True)
         (models / "my-own.gguf").write_bytes(b"x")
         self.assertEqual(self.engine.default_model(), str(models / "my-own.gguf"))
 
@@ -906,6 +1084,69 @@ class EngineTests(unittest.TestCase):
         first = llama_server.manager(self.root)
         self.assertIs(first, llama_server.manager(self.root))
         self.assertIsNot(first, Manager(self.root))
+
+
+class OrphanEngineTests(unittest.TestCase):
+    """The engine process a phone leaves behind when it kills the app.
+
+    Android kills a backgrounded app rather than let it hold a gigabyte of
+    weights, and that kill does not reach the child process. Each launch would
+    otherwise leave one more llama-server holding the same model's memory, so
+    the next launch clears them out first - but only ones that are unmistakably
+    this app's own engine. `_reap_orphans` reads a `/proc` it is handed, which
+    is what makes all of that checkable here.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.libdir = self.base / "native" / "arm64"
+        self.libdir.mkdir(parents=True)
+        self.engine = self.libdir / catalog.BUNDLED_ENGINE_BINARY
+        self.engine.write_bytes(b"\x7fELF fake")
+        self.proc = self.base / "proc"
+        self.proc.mkdir()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def process(self, pid: int, argv) -> int:
+        folder = self.proc / str(pid)
+        folder.mkdir()
+        (folder / "cmdline").write_bytes(b"\x00".join(arg.encode() for arg in argv) + b"\x00")
+        return pid
+
+    def reap(self, own_pid: int = 1):
+        killed = []
+        with mock.patch.object(llama_server.os, "kill", lambda pid, sig: killed.append(pid)):
+            found = llama_server._reap_orphans(self.libdir, proc_root=str(self.proc), own_pid=own_pid)
+        return found, killed
+
+    def test_a_leftover_engine_is_stopped(self):
+        pid = self.process(4242, [str(self.engine), "-m", "/models/notes.gguf", "--port", "9111"])
+        found, killed = self.reap()
+        self.assertEqual(found, [pid])
+        self.assertEqual(killed, [pid])
+
+    def test_nothing_else_is_touched(self):
+        # Another app's copy of the same engine: not ours to kill.
+        self.process(11, ["/data/data/org.other/lib/arm64/" + catalog.BUNDLED_ENGINE_BINARY,
+                          "-m", "/models/b.gguf"])
+        # A process that merely mentions it - a shell, an editor, a grep.
+        self.process(12, ["/system/bin/sh", "-c", "grep llama-server /proc/cpuinfo"])
+        # Ours, but not llama-server's argument shape.
+        self.process(13, [str(self.engine), "--version"])
+        # This very process.
+        self.process(14, [str(self.engine), "-m", "/models/c.gguf"])
+        found, killed = self.reap(own_pid=14)
+        self.assertEqual(found, [])
+        self.assertEqual(killed, [])
+
+    def test_a_healthy_process_table_has_nothing_to_reap(self):
+        self.process(7, ["/system/bin/init", "second_stage"])
+        self.assertEqual(self.reap(), ([], []))
+        self.assertEqual(llama_server._reap_orphans(None, proc_root=str(self.proc)), [])
+        self.assertEqual(llama_server._reap_orphans(self.libdir, proc_root=str(self.base / "nope")), [])
 
 
 class FakeWebview:
@@ -1089,6 +1330,154 @@ class EntryPointTests(unittest.TestCase):
 
     def test_the_old_no_browser_flag_still_works(self):
         self.assertTrue(parse_args(["--no-browser"]).no_browser)
+
+
+MOBILE_ENTRY = (Path(__file__).resolve().parents[1] / "android" / "app" / "src" / "main"
+                / "python" / "aura_mobile.py")
+
+
+def load_mobile():
+    """The Android entry point, loaded by path - it is not part of the package."""
+    existing = sys.modules.get("aura_mobile")
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location("aura_mobile", MOBILE_ENTRY)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["aura_mobile"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class AndroidEntryPointTests(unittest.TestCase):
+    """The Android entry point's own logic, with no Android underneath it.
+
+    `aura_mobile` is what the Java layer calls. Everything it does before the
+    server starts - taking the app's paths, choosing where models go on a first
+    run, unloading the model when the app leaves the screen - is ordinary Python,
+    so it can be checked here.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.storage = self.base / "sdcard"
+        self.storage.mkdir()
+        self.root = self.base / "data"
+        self.root.mkdir()
+        self.mobile = load_mobile()
+
+    def tearDown(self):
+        llama_server.reset()
+        self.temp.cleanup()
+
+    def payload(self, **extra):
+        data = {"data_dir": str(self.root), "models_dir": str(self.storage / "models"),
+                "storage_root": str(self.storage), "native_lib_dir": "/data/app/lib/arm64",
+                "permission": "all", "app_version": "1.0.0", "api_level": 34}
+        data.update(extra)
+        return json.dumps(data)
+
+    def test_the_apps_configuration_becomes_the_environment(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            payload = self.mobile.apply_config(self.payload())
+            self.assertEqual(payload["permission"], "all")
+            self.assertEqual(os.environ["AURA_ANDROID"], "1")
+            self.assertTrue(host.is_android())
+            self.assertEqual(host.data_dir_env(), str(self.root))
+            self.assertEqual(host.models_dir_env(), str(self.storage / "models"))
+            self.assertEqual(host.native_lib_dir(), "/data/app/lib/arm64")
+            self.assertTrue(host.can_read_files())
+            self.assertEqual(host.platform_key(), "android")
+            self.assertEqual(host.storage_root(), str(self.storage))
+
+    def test_configuration_that_is_not_json_is_survivable(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(self.mobile.apply_config("not json at all"), {})
+            self.assertTrue(host.is_android())
+            self.assertEqual(host.data_dir_env(), "")
+
+    def test_the_first_run_puts_the_models_on_the_storage_the_user_has(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.mobile.apply_config(self.payload())
+            written = self.mobile._apply_first_run_defaults(self.root)
+            self.assertEqual(written["models_dir"], str(self.storage / "models"))
+            self.assertGreaterEqual(written["llm_threads"], 1)
+            settings = config.load_settings(self.root)
+            self.assertEqual(settings["models_dir"], str(self.storage / "models"))
+            self.assertGreater(settings["llm_threads"], 0)
+            # And it happens once: after this the settings file is the user's.
+            self.assertEqual(self.mobile._apply_first_run_defaults(self.root), {})
+
+    def test_the_background_watch_never_raises(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.mobile.apply_config(self.payload())
+            watch = self.mobile.BackgroundWatch(self.root, grace=0.05)
+            watch.background()
+            watch.foreground()      # the model stays loaded if the app comes back
+            watch.background()
+            time.sleep(0.15)
+            watch.foreground()
+            self.assertEqual(llama_server.manager(self.root).state, "stopped")
+
+
+class AndroidMirrorTests(unittest.TestCase):
+    """The phone runs a copy of aura/, so the copy has to be the same files.
+
+    The Android build packages the Python that sits inside the APK, and
+    Chaquopy's source directory cannot point at the repo root without dragging
+    the Gradle project's own build output into the app, so
+    `android/app/src/main/python/aura` is a copy that android/tools/sync_aura.py
+    keeps identical. This is the test that fails the moment the two drift apart:
+    the alternative is a phone quietly running last week's code.
+    """
+
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1]
+        self.android = self.root / "android"
+
+    def load_sync(self):
+        tools = str(self.android / "tools")
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        import sync_aura  # noqa: E402
+        return sync_aura
+
+    def test_the_android_copy_is_byte_for_byte_the_desktop_tree(self):
+        problems = self.load_sync().differences()
+        self.assertEqual(problems, [], "run: python android/tools/sync_aura.py")
+
+    def test_the_build_script_bundles_every_file_the_catalog_lists(self):
+        script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
+        for name in catalog.ENGINE_BUNDLE_FILES:
+            self.assertIn('"{}"'.format(name), script, name)
+        self.assertIn('def engineBinary = "{}"'.format(catalog.BUNDLED_ENGINE_BINARY), script)
+        self.assertIn(catalog.ENGINE_ARCHIVE, script)
+
+    def test_the_app_is_chaquopy_python_behind_a_webview(self):
+        script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
+        self.assertIn("com.chaquo.python", script)
+        self.assertIn('srcDirs = ["src/main/python"]', script)
+        self.assertIn("arm64-v8a", script)
+        self.assertIn("useLegacyPackaging = true", script)
+        entry = MOBILE_ENTRY.read_text(encoding="utf-8")
+        self.assertIn("def main(", entry)
+        self.assertIn("from aura import", entry)
+
+    def test_the_manifest_asks_for_files_and_starts_python(self):
+        manifest = (self.android / "app" / "src" / "main" / "AndroidManifest.xml").read_text("utf-8")
+        self.assertIn("com.chaquo.python.android.PyApplication", manifest)
+        self.assertIn("android.permission.MANAGE_EXTERNAL_STORAGE", manifest)
+        self.assertIn("android.permission.READ_EXTERNAL_STORAGE", manifest)
+        self.assertIn("android.permission.INTERNET", manifest)
+        self.assertIn('android:name=".MainActivity"', manifest)
+        self.assertNotIn("org.aura.pocket", manifest)
+
+    def test_the_remote_control_app_is_gone(self):
+        java = self.android / "app" / "src" / "main" / "java" / "org" / "aura"
+        self.assertFalse((java / "pocket").exists())
+        for name in ("MainActivity.java", "Host.java", "Pickers.java"):
+            self.assertTrue((java / "app" / name).is_file(), name)
+        self.assertFalse((self.android / "app" / "src" / "main" / "assets" / "index.html").exists())
 
 
 class BuildRecipeTests(unittest.TestCase):

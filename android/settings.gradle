@@ -1,7 +1,7 @@
 pluginManagement {
     repositories {
         google()
-        mavenCentral()
+        mavenCentral()          // the Chaquopy Gradle plugin is published here
         gradlePluginPortal()
     }
 }
@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "AURA Pocket"
+rootProject.name = "AURA"
 include ":app"

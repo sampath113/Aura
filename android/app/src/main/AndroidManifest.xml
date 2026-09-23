@@ -1,13 +1,31 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- AURA serves its own interface on 127.0.0.1 and shows it in a WebView,
+         which needs a socket, so it needs this. Nothing leaves the phone. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- AURA's whole point is that it can be asked about the documents the
+         student already has - their own PDFs, in their own folders - which
+         means reading them by path. That is what this permission is for; it is
+         the same one a file manager asks for, and Android only grants it to an
+         app the user has chosen. Settings, inside the app, offers the one tap
+         that grants it, and AURA works without it too (files added through the
+         system picker are copied in, so they can still be read). -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <!-- Android 12 and older ask for storage this way instead. -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
     <application
+        android:name="com.chaquo.python.android.PyApplication"
         android:allowBackup="true"
         android:icon="@drawable/ic_aura"
         android:label="@string/app_name"
+        android:largeHeap="true"
         android:supportsRtl="true"
         android:theme="@style/AuraTheme"
         android:usesCleartextTraffic="true">

@@ -1,3 +1,18 @@
+// The Android build.
+//
+// Two plugins, and both are load-bearing:
+//
+//   * the Android Gradle plugin, which packages the app;
+//   * Chaquopy, which puts a real CPython inside the APK and starts it, because
+//     AURA *is* Python (the same program the desktop build ships).
+//
+// Chaquopy lives on Maven Central (settings.gradle already looks there), which
+// is why no extra repository is declared for it.
+//
+// Versions here are deliberately a matched set: Chaquopy 16.1.0 supports Android
+// Gradle plugin 8.6-8.8, and the Android plugin 8.6.x needs Gradle 8.7 or newer
+// (the build server installs 8.7).
 plugins {
-    id 'com.android.application' version '8.5.2' apply false
+    id 'com.android.application' version '8.6.1' apply false
+    id 'com.chaquo.python' version '16.1.0' apply false
 }
