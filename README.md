@@ -305,6 +305,31 @@ column is not a grid at all.
   nothing may assume it can be installed later: `install_runtime()` refuses, the
   model card hides the button, and the "engine missing" sentence must not tell a
   phone user to look for a Settings button that cannot exist.
+* **A build that lost the engine is not a build.** The engine is fetched, size- and
+  sha256-checked, and unpacked *during* the build, so the failure that matters is not
+  "the fetch failed" - it is "the fetch failed and an APK shipped anyway", which looks
+  like a working app until a model is needed. `prepareAuraEngine` therefore **fails the
+  build** unless `-PauraEngineOptional=true` was asked for, and after assembling, the
+  APK is opened and `lib/arm64-v8a/libllama-server-bin.so` looked for inside it
+  (`apkCarriesEngine`). `android/README.md` has the full reasoning; the pinned archive
+  size and sha256 live in `build.gradle`, with a mirrored copy of the archive as a
+  second source so a build machine that cannot reach GitHub still gets an engine.
+* **A screen that says something is wrong must say what to do about it.** The model
+  card prints `status()["detail"]` beside "could not start": a state of error with an
+  empty detail is the one thing it must never publish, so `Manager.status()` fills the
+  reason in (naming the missing engine file when there is one). And a build with no
+  engine in it is *not* "could not start" - it gets its own state, its own sentence
+  ("no engine in this build - install a build of AURA that includes the engine"), and
+  **no buttons that cannot work**: no Load, no Test, no model download, just Check
+  again. Saying "could not start" there sends the reader hunting for a fault in their
+  own settings.
+* **A message on screen must not be able to outlive its welcome.** Toasts each carry
+  their own expiry (`dataset.expires`), remove every older bubble when they appear, and
+  are swept by a one-second interval in `boot()`; the upload notice is *sticky* and is
+  taken down in a `finally`. The version that shared one `toastTimer` left the earlier
+  bubble on screen for ever - the "Reading <file>..." that was welded to the bottom of
+  the window - because the next toast cleared its timeout before it fired. Nothing
+  that leaves a stale message on screen is acceptable here.
 * **A kill does not reach the engine.** Android kills a backgrounded app, and
   `llama-server` survives it, so the next start reaps it (`_reap_orphans`) — and
   only it: another app's copy of the same binary, or any process that merely
@@ -405,9 +430,11 @@ the small definition-bias tweak to sentence ranking.
   saying so - it never invents an answer, so "no direct match" is a real outcome.
 * On a phone the engine that runs the model arrives **inside the APK** (Android
   will not execute a file the app downloaded itself), so the APK is tens of
-  megabytes and it is built for 64-bit devices only (`arm64-v8a`). If a build
-  machine cannot reach GitHub, the APK still works and says that it was built
-  without the engine.
+  megabytes and it is built for 64-bit devices only (`arm64-v8a`). A build that
+  cannot bundle the engine no longer produces an APK: it stops with the reason in
+  the log, because an engine-less APK is a quoter that looks like a working app until
+  somebody tries to load a model. `-PauraEngineOptional=true` builds that version on
+  purpose, and then the app says plainly that it was made without the engine.
 * Executing the engine from the app's native library directory is the standard
   answer to that Android rule, but it is the one thing here that a strict device
   or SELinux policy can refuse; `android/README.md` says where to look when that

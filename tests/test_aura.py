@@ -654,6 +654,22 @@ class BundledEngineTests(unittest.TestCase):
         self.assertIn("local model engine is not", desktop)
         self.assertIn("Settings", desktop)
 
+    def test_a_half_bundled_engine_names_what_is_missing(self):
+        """A build that lost one shared object on the way through the build
+        machine can only be diagnosed on the phone, and only if the phone says
+        which file it is - "the engine is missing" is a sentence nobody can act
+        on, a filename is something to look for."""
+        gone = "libggml.so"
+        (self.libdir / gone).unlink()
+        android, folder = self.on_a_phone()
+        with android, folder:
+            state = Manager(self.base / "data").engine_state()
+            self.assertFalse(state["installed"])
+            message = llama_server._engine_missing_message(state, "qwen.gguf")
+            self.assertIn(gone, message)
+            self.assertIn("qwen.gguf", message)
+            self.assertNotIn("Settings", message)
+
 
 class ModelFileTests(unittest.TestCase):
     def setUp(self):
@@ -1004,6 +1020,29 @@ class EngineTests(unittest.TestCase):
             self.engine.start(model, {})
         self.assertIn("engine is not installed", str(caught.exception))
         self.assertEqual(self.engine.state, "error")
+
+    def test_an_error_state_is_never_published_without_a_reason(self):
+        """The settings screen prints `status()["detail"]` beside "could not
+        start". A state of error with nothing next to it tells the reader that
+        something is wrong and gives them nothing to act on, so status() fills
+        the reason in from whatever is actually known."""
+        model = self.model_file()
+        self.engine.state = "error"
+        self.engine.detail = ""
+        self.engine.model_path = str(model)
+        status = self.engine.status()
+        self.assertEqual(status["state"], "error")
+        self.assertIn("engine is not installed", status["detail"])
+
+    def test_an_error_with_the_engine_present_still_says_something(self):
+        folder = self.root / "runtime" / "llama-b11136-linux-x64"
+        folder.mkdir(parents=True)
+        (folder / catalog.binary_name()).write_bytes(b"#!binary")
+        self.engine.state = "error"
+        self.engine.detail = ""
+        status = self.engine.status()
+        self.assertTrue(status["engine_installed"])
+        self.assertIn("did not say why", status["detail"])
 
     def test_an_installed_engine_is_found_even_without_its_record(self):
         folder = self.root / "runtime" / "llama-b11136-linux-x64"
@@ -1450,22 +1489,84 @@ class AndroidMirrorTests(unittest.TestCase):
         script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
         for name in catalog.ENGINE_BUNDLE_FILES:
             self.assertIn('"{}"'.format(name), script, name)
-        self.assertIn('@Field String engineBinary = "{}"'.format(catalog.BUNDLED_ENGINE_BINARY),
-                      script)
+        self.assertIn('def engineBinary = "{}"'.format(catalog.BUNDLED_ENGINE_BINARY), script)
         self.assertIn(catalog.ENGINE_ARCHIVE, script)
 
-    def test_the_values_a_groovy_method_reads_are_fields(self):
-        """A method in a Groovy build script cannot see a plain `def` at script
-        level - it is not a property of the script, so the reference fails with
-        "Could not get unknown property" while the script is being evaluated,
-        before a single line has been compiled and long before the Android build
-        starts. Anything at script level that a method reads must be an @Field.
+    def test_script_values_reach_the_code_that_reads_them(self):
+        """Groovy gives these two scopes opposite visibility of a script-level
+        value, and both ways of getting it wrong are run-time surprises rather
+        than compile errors - each has already cost an Android build:
 
-        This is not hypothetical: the first Android build failed exactly here."""
+            def     -> visible to closures, invisible to methods
+            @Field  -> visible to methods, invisible to closures
+
+        So `def` is for anything a closure reads, `@Field` for anything a method
+        reads, and a value that both need is passed as a parameter. The failure
+        message is "Could not get unknown property `<name>` for project ':app'"
+        (script evaluation) or "... for task ':app:prepareAuraEngine'" (task
+        run) - both after a green-looking gradle start."""
         script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
         self.assertIn("import groovy.transform.Field", script)
-        self.assertIn("@Field String engineBinary", script)
+        # read by detectBuildPython(), a method -> @Field
         self.assertIn("@Field List<String> supportedPython", script)
+        # read by the prepareAuraEngine closure -> def, and handed to the method
+        self.assertIn("def engineBinary = ", script)
+        self.assertIn("void stripEngine(File outDir, List<String> names, String binaryName)", script)
+        self.assertIn("stripEngine(outDir, new ArrayList<String>(wanted.values()), engineBinary)",
+                      script)
+        # read by the engine methods -> @Field, because `logger` inside a method is
+        # the same trap as `engineBinary` inside a closure
+        self.assertIn("@Field def auraLog = logger", script)
+        for name in ("fetchEngineArchive", "stripEngine", "tryStrip"):
+            body = self.method_body(script, name)
+            self.assertIn("auraLog.", body, name)
+            self.assertNotIn("logger.", body, name)
+
+    @staticmethod
+    def method_body(script: str, name: str) -> str:
+        """One script-level method, from its signature to the first line that is
+        just a closing brace - which is how every method in this file ends."""
+        marker = " {}(".format(name)
+        lines = script.split("\n")
+        for index, line in enumerate(lines):
+            if marker in line and line.startswith(
+                    ("String ", "File ", "boolean ", "void ", "List<File> ")):
+                end = index
+                while end < len(lines) and lines[end] != "}":
+                    end += 1
+                return "\n".join(lines[index:end + 1])
+        raise AssertionError("no method named " + name)
+
+    def test_a_build_that_lost_the_engine_cannot_look_like_a_success(self):
+        """The engine arrives during the build, so the failure to fear is not
+        "the download broke" - it is "the download broke and an APK shipped
+        anyway", which looks like success and behaves like a broken app. Two
+        things stop that, and both are asserted here: the engine-less build is
+        opt-in, and the APK itself is opened and checked after assembling."""
+        script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
+        self.assertIn("auraEngineOptional", script)
+        self.assertIn("AURA_ENGINE_OPTIONAL", script)
+        self.assertIn("apkCarriesEngine", script)
+        self.assertIn("lib/arm64-v8a/", script)
+        self.assertIn("NO MODEL ENGINE INSIDE IT", script)
+        self.assertIn("GradleException", script)
+
+    def test_the_engine_archive_is_fetched_whole_or_not_at_all(self):
+        """A truncated download or a mirror that has moved would otherwise be
+        unpacked into an app that cannot run, so every attempt is checked
+        against a pinned size and sha256 - and there is a second source to fall
+        back to, so a build machine that cannot reach GitHub still gets an
+        engine."""
+        script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
+        self.assertIn("def engineArchiveBytes =", script)
+        digest = [line for line in script.splitlines() if "def engineArchiveSha256" in line][0]
+        pinned = digest.split('"')[1]
+        self.assertEqual(len(pinned), 64)
+        int(pinned, 16)  # hex, or this raises
+        self.assertIn("sha256Of", script)
+        self.assertIn("def engineMirrors = [", script)
+        self.assertGreaterEqual(script.count("https://"), 2)
+        self.assertIn(catalog.ENGINE_ARCHIVE, script)
 
     def test_the_app_is_chaquopy_python_behind_a_webview(self):
         script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")

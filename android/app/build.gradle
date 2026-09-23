@@ -29,6 +29,15 @@ plugins {
     id 'com.chaquo.python'
 }
 
+// The log the *methods* below write to.
+//
+// A method cannot see a script-level `def` (see the note on engineBinary), so
+// anything a method needs has to be an `@Field` - the second of the two scoping
+// rules this file has already been bitten by. `logger` resolves fine inside
+// closures, but the engine code that reports sizes and failures is in methods,
+// so there is exactly one logger and it lives here.
+@Field def auraLog = logger
+
 // ---------------------------------------------------------------------------
 // The model engine
 // ---------------------------------------------------------------------------
@@ -40,16 +49,54 @@ def engineTag = "b11136"
 def engineArchiveName = "llama-${engineTag}-bin-android-arm64.tar.gz"
 def engineUrl = "https://github.com/ggml-org/llama.cpp/releases/download/${engineTag}/${engineArchiveName}"
 
+// The same archive, kept on a second host. GitHub's release download is the
+// canonical source, but a build machine that cannot reach it - an egress rule,
+// a rate limit, an outage - would produce an APK with no engine in it, and that
+// failure is invisible until somebody tries to load a model on the phone. So
+// there are two sources and each one has to produce a byte-exact copy: the
+// pinned size and sha256 below are checked after every attempt.
+//
+// Re-fetching the canonical copy is one command:
+//   curl -L -o llama-b11136-bin-android-arm64.tar.gz \
+//     https://github.com/ggml-org/llama.cpp/releases/download/b11136/llama-b11136-bin-android-arm64.tar.gz
+def engineArchiveBytes = 72537038L
+def engineArchiveSha256 = "6217fb610015b2e5cc702a52c715a59d23776172c9da8056a1a43f3f524debaa"
+def engineMirrors = [
+        engineUrl,
+        "https://user.uploads.dev/file/59e4a2b907fa4a05ddb9397c8a399c0a.gz",
+]
+
+// A build without the engine is a different app: half the size, and it reads,
+// searches and quotes your documents, but it cannot run a model. That is a
+// reasonable thing to want - it is what a build machine that cannot reach the
+// internet can still produce - but it must never happen *by accident*, because
+// the result looks fine until the moment a model is needed. So it is opt-in:
+// pass -PauraEngineOptional=true (or set AURA_ENGINE_OPTIONAL=1) to allow it,
+// and otherwise a build that cannot bundle the engine fails, in this log, with
+// the reason.
+def engineOptionalValue = (project.findProperty("auraEngineOptional")
+        ?: System.getenv("AURA_ENGINE_OPTIONAL") ?: "false") as String
+def engineOptional = ["1", "true", "yes", "on"].contains(engineOptionalValue.trim().toLowerCase())
+def engineRequired = !engineOptional
+
 // llama.cpp's Android build is a seven-kilobyte launcher plus the real code in
 // shared objects. The launcher is the executable; Android only puts files named
 // lib*.so into the native library directory (the one place an app may execute
 // from), so it is renamed on the way in.
 //
-// `@Field` rather than `def`, and the same goes for supportedPython below: a
-// method in a Groovy build script cannot see a plain `def` at script level. It
-// reports "Could not get unknown property" the moment the script is evaluated,
-// before a single line is compiled.
-@Field String engineBinary = "libllama-server-bin.so"
+// Two opposite scoping rules live in these two lines, and each has already cost
+// a build:
+//
+//   * a plain `def` at script level is visible to *closures* but invisible to
+//     *methods*;
+//   * an `@Field` is visible to methods but invisible to closures.
+//
+// So `engineBinary` stays a `def` - the prepareAuraEngine closure below reads
+// it - and is handed to stripEngine() as a parameter, while `supportedPython`
+// (further down) is an `@Field` because only a method reads that one. Getting
+// either backwards is not a compile error: it is "Could not get unknown
+// property ..." at the moment the code runs.
+def engineBinary = "libllama-server-bin.so"
 def engineLibs = [
         "libllama-server-impl.so",
         "libllama-common.so",
@@ -182,8 +229,11 @@ android {
         applicationId 'org.aura.app'
         minSdk 26
         targetSdk 34
-        versionCode 1
-        versionName '1.0.0'
+        // Bumped whenever the phone-visible behaviour changes, because the
+        // settings screen shows this string: "did the new build actually
+        // install?" should be answerable from the phone without guessing.
+        versionCode 2
+        versionName '1.1.0'
 
         // The Python interpreter and the engine are both native code, and a
         // 32-bit build would need a different engine. A phone that runs a
@@ -259,6 +309,107 @@ chaquopy {
 // ---------------------------------------------------------------------------
 // Unpacking the engine into the APK
 // ---------------------------------------------------------------------------
+/** "243.6 MB" - so the log says sizes in units a person reads. */
+String humanSize(long bytes) {
+    def value = bytes as double
+    def units = ["B", "KB", "MB", "GB"]
+    def index = 0
+    while (value >= 1024.0d && index < units.size() - 1) {
+        value /= 1024.0d
+        index++
+    }
+    return index <= 1 ? String.format("%.0f %s", value, units[index])
+                      : String.format("%.1f %s", value, units[index])
+}
+
+/** The lowercase hex sha256 of a file. */
+String sha256Of(File file) {
+    def digest = java.security.MessageDigest.getInstance("SHA-256")
+    file.withInputStream { input ->
+        byte[] buffer = new byte[1 << 16]
+        int read = 0
+        while ((read = input.read(buffer)) > 0) {
+            digest.update(buffer, 0, read)
+        }
+    }
+    return digest.digest().collect { String.format("%02x", it & 0xff) }.join("")
+}
+
+/** Fetch the engine archive from the first source that hands over a whole copy.
+ *
+ *  Every attempt is checked against the pinned size and sha256, so a truncated
+ *  download, or a mirror that has changed underneath us, is retried instead of
+ *  being unpacked into an app that will not run. If nothing works it throws with
+ *  every reason attached - a build log that says why is worth a lot more than
+ *  one that says "could not prepare the engine".
+ */
+File fetchEngineArchive(File rawDir, String archiveName, List<String> urls,
+                        long expectedBytes, String expectedSha256, File target) {
+    rawDir.mkdirs()
+    def problems = new ArrayList<String>()
+    for (String url : urls) {
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            def part = new File(rawDir, archiveName + ".part")
+            part.delete()
+            try {
+                auraLog.lifecycle("AURA: fetching the model engine from ${url} (attempt ${attempt})")
+                def connection = new URL(url).openConnection()
+                connection.connectTimeout = 30000
+                connection.readTimeout = 180000
+                connection.setRequestProperty("User-Agent", "AURA-build")
+                connection.inputStream.withCloseable { input ->
+                    part.withOutputStream { output ->
+                        byte[] buffer = new byte[1 << 16]
+                        int read = 0
+                        while ((read = input.read(buffer)) > 0) {
+                            output.write(buffer, 0, read)
+                        }
+                    }
+                }
+            } catch (Exception error) {
+                part.delete()
+                problems << "${url} (attempt ${attempt}): ${error}"
+                continue
+            }
+            long bytes = part.length()
+            if (expectedBytes > 0L && bytes != expectedBytes) {
+                part.delete()
+                problems << "${url}: got ${bytes} bytes, expected ${expectedBytes}"
+                continue
+            }
+            String digest = sha256Of(part)
+            if (expectedSha256 && !expectedSha256.equalsIgnoreCase(digest)) {
+                part.delete()
+                problems << "${url}: sha256 ${digest}, expected ${expectedSha256}"
+                continue
+            }
+            if (!part.renameTo(target)) {
+                part.delete()
+                problems << "${url}: the finished download could not be kept"
+                continue
+            }
+            auraLog.lifecycle("AURA: the model engine archive arrived whole (${humanSize(bytes)})")
+            return target
+        }
+    }
+    throw new GradleException("no source produced a valid engine archive:\n  " + problems.join("\n  "))
+}
+
+/** True when the built APK really does carry the engine.
+ *
+ *  Asked of the APK itself rather than of the step that was supposed to put it
+ *  there, because the failure that matters is not "the download failed" - it is
+ *  "the download failed and the APK shipped anyway".
+ */
+boolean apkCarriesEngine(File apk, String binaryName) {
+    def zip = new java.util.zip.ZipFile(apk)
+    try {
+        return zip.getEntry("lib/arm64-v8a/" + binaryName) != null
+    } finally {
+        zip.close()
+    }
+}
+
 List<File> stripTools() {
     def found = []
     // Named apart from the onPath() method above so there is no shadowing.
@@ -310,7 +461,7 @@ boolean tryStrip(File tool, File file) {
         def text = process.inputStream.text
         def code = process.waitFor()
         if (code != 0) {
-            logger.lifecycle("AURA: ${tool.name} could not strip ${file.name}: ${text.trim()}")
+            auraLog.lifecycle("AURA: ${tool.name} could not strip ${file.name}: ${text.trim()}")
         }
         return code == 0 && file.length() > 0L
     } catch (Exception ignored) {
@@ -320,29 +471,35 @@ boolean tryStrip(File tool, File file) {
 
 /** Strip the debug information out of the engine, best effort and safely.
  *
- *  It is most of the download: the engine as published is about 230 MB, and
- *  about 20 MB once stripped. Nothing here is worth failing a build over, so
- *  every step works on a copy and is abandoned quietly if it does not work. */
-void stripEngine(File outDir, List<String> names) {
+ *  It is nearly all of what the engine weighs: the fourteen files as published
+ *  total about 243 MB, and stripping removes most of that - the sizes before and
+ *  after are logged, so the build log says what the APK is really carrying.
+ *  Nothing here is worth failing a build over (the engine runs either way, it is
+ *  only bigger), so every step works on a copy and is abandoned quietly if it
+ *  does not work. */
+void stripEngine(File outDir, List<String> names, String binaryName) {
     def tools = stripTools()
+    def sizeOf = { List<String> list -> list.inject(0L) { total, name -> total + new File(outDir, name).length() } }
+    long before = sizeOf(names)
     if (tools.isEmpty()) {
-        logger.lifecycle("AURA: no ELF strip tool on this machine - the engine keeps its debug "
-                + "information, and the APK will be a good deal larger")
+        auraLog.warn("AURA: no ELF strip tool on this machine (looked on PATH and in every NDK) - the "
+                + "engine keeps its debug information and the APK will be about ${humanSize(before)} "
+                + "bigger than it needs to be. On a Debian-style build machine: apt-get install -y binutils")
         return
     }
-    def binary = new File(outDir, engineBinary)
+    def binary = new File(outDir, binaryName)
     for (File tool : tools) {
         if (!binary.isFile()) {
             return
         }
-        def probe = new File(outDir, engineBinary + ".probe")
+        def probe = new File(outDir, binaryName + ".probe")
         probe.bytes = binary.bytes
         if (!tryStrip(tool, probe)) {
             probe.delete()
             continue
         }
         probe.delete()
-        logger.lifecycle("AURA: stripping the engine with ${tool}")
+        auraLog.lifecycle("AURA: stripping the engine (${humanSize(before)}) with ${tool}")
         names.each { name ->
             def target = new File(outDir, name)
             if (!target.isFile()) {
@@ -359,10 +516,13 @@ void stripEngine(File outDir, List<String> names) {
                 copy.delete()
             }
         }
+        long after = sizeOf(names)
+        auraLog.lifecycle("AURA: the engine is ${humanSize(after)} (was ${humanSize(before)})")
         return
     }
-    logger.warn("AURA: none of the strip tools on this machine could strip the engine - it keeps "
-            + "its debug information and the APK will be a good deal larger")
+    auraLog.warn("AURA: none of the strip tools on this machine could strip the engine - it keeps "
+            + "its debug information and the APK will be about ${humanSize(before)} bigger than it "
+            + "needs to be")
 }
 
 tasks.register("prepareAuraEngine") {
@@ -382,21 +542,20 @@ tasks.register("prepareAuraEngine") {
             def outDir = engineJniDir.get().asFile
             def archive = new File(rawDir, engineArchiveName)
 
-            if (!archive.isFile() || archive.length() < 1000000L) {
-                logger.lifecycle("AURA: downloading the model engine (${engineArchiveName}, about 70 MB)")
-                rawDir.mkdirs()
-                def part = new File(rawDir, engineArchiveName + ".part")
-                part.delete()
-                new URL(engineUrl).withInputStream { input ->
-                    part.withOutputStream { output -> output << input }
-                }
-                if (!part.renameTo(archive)) {
-                    part.delete()
-                    throw new IOException("the downloaded archive could not be kept")
-                }
+            // A copy left over from an earlier run is only reused if it is
+            // still exactly the file we think it is.
+            if (archive.isFile() && (archive.length() != engineArchiveBytes
+                    || !engineArchiveSha256.equalsIgnoreCase(sha256Of(archive)))) {
+                logger.lifecycle("AURA: the cached engine archive does not match the pinned one - fetching again")
+                archive.delete()
+            }
+            if (!archive.isFile()) {
+                fetchEngineArchive(rawDir, engineArchiveName, engineMirrors,
+                        engineArchiveBytes, engineArchiveSha256, archive)
             }
 
             def unpacked = new File(rawDir, "unpacked")
+            project.delete(unpacked)
             unpacked.mkdirs()
             project.ant.untar(src: archive, dest: unpacked, compression: "gzip", overwrite: true)
             def sourceDir = null
@@ -424,18 +583,37 @@ tasks.register("prepareAuraEngine") {
                 }
             }
             if (missing) {
-                logger.warn("AURA: the engine archive was missing ${missing.join(', ')}")
+                // Half an engine is not an engine: llama-server would start and
+                // die on a missing shared object, which is the worst kind of
+                // failure to debug from a phone.
+                throw new IOException("the engine archive did not contain ${missing.join(', ')}")
             }
 
-            stripEngine(outDir, new ArrayList<String>(wanted.values()))
+            // engineBinary is a script-level `def`, which stripEngine() - a
+            // method - cannot see, so it is handed over explicitly.
+            stripEngine(outDir, new ArrayList<String>(wanted.values()), engineBinary)
 
             stamp.parentFile.mkdirs()
             stamp.text = "${engineTag}\n"
-            logger.lifecycle("AURA: the model engine is ready (${engineBinary})")
+            long total = wanted.values().inject(0L) { sum, name -> sum + new File(outDir, name).length() }
+            logger.lifecycle("AURA: the model engine is ready - ${wanted.size()} files, ${humanSize(total)}, "
+                    + "${engineTag}")
         } catch (Exception error) {
-            logger.warn("AURA: could not prepare the model engine (${error}). The app will still "
-                    + "build: it will index, search and answer with quoted passages, but it will not "
-                    + "be able to run a local model - and it will say so on screen.")
+            if (engineRequired) {
+                // Deliberately fatal. Shipping an APK with no engine in it looks
+                // like success and behaves like a broken app, and the person who
+                // finds out is the one holding the phone. Pass
+                // -PauraEngineOptional=true to build the quoted-answers-only
+                // version on purpose.
+                throw new GradleException("AURA: the model engine could not be bundled, so this build "
+                        + "is stopping here rather than producing an app that cannot run a model. "
+                        + "Reason: ${error}. Pass -PauraEngineOptional=true if you really want the "
+                        + "engine-less build.", error)
+            }
+            logger.warn("AURA: could not prepare the model engine (${error}), and -PauraEngineOptional "
+                    + "was given, so the app will still build: it will index, search and answer with "
+                    + "quoted passages, but it will not be able to run a local model - and it will say "
+                    + "so on screen.")
         }
     }
 }
@@ -451,4 +629,47 @@ tasks.matching { it.name.startsWith("merge") && (it.name.endsWith("JniLibFolders
 }
 tasks.named("preBuild") {
     dependsOn(auraEngine)
+}
+
+// ---------------------------------------------------------------------------
+// The proof
+// ---------------------------------------------------------------------------
+// The engine step above can be cached, skipped, or quietly undone by a later
+// change to packaging, so the last word belongs to the APK itself: every APK
+// this project assembles is opened, its size printed in the log, and the engine
+// looked for inside it. When the engine is required (the default) an APK
+// without one fails the build here - which is the only place that can be caught
+// for certain, and the difference between "the build broke" and "the app
+// installed and then could not run a model".
+tasks.matching { it.name == "assembleRelease" || it.name == "assembleDebug" }.configureEach {
+    doLast {
+        def apkRoot = layout.buildDirectory.dir("outputs/apk").get().asFile
+        def apks = []
+        if (apkRoot.isDirectory()) {
+            apkRoot.eachFileRecurse { file ->
+                if (file.isFile() && file.name.endsWith(".apk")) {
+                    apks << file
+                }
+            }
+        }
+        if (apks.isEmpty()) {
+            logger.warn("AURA: no APK was found to check under ${apkRoot}")
+            return
+        }
+        boolean engineMissing = false
+        apks.each { apk ->
+            boolean carries = apkCarriesEngine(apk, engineBinary)
+            logger.lifecycle("AURA: ${apk.name} - ${humanSize(apk.length())}" +
+                    (carries ? " - the model engine is inside it" : " - NO MODEL ENGINE INSIDE IT"))
+            if (!carries) {
+                engineMissing = true
+            }
+        }
+        if (engineMissing && engineRequired) {
+            throw new GradleException("AURA: an APK was assembled without the model engine in it, and "
+                    + "this build requires one - see the prepareAuraEngine log above for the reason. "
+                    + "Pass -PauraEngineOptional=true if you meant to build the quoted-answers-only "
+                    + "version.")
+        }
+    }
 }

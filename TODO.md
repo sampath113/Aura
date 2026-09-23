@@ -314,3 +314,80 @@ appear in it (chips that are one line measure 41px and are drawn wrapped). Trust
 `getBoundingClientRect` over the picture. Nothing in `aura/webui/` is covered by
 the Python tests - they check that the files are *served*, never what they look
 like - so a visual change needs to be looked at by hand.
+
+---
+
+## 7. The engine, the stuck message, and the settings screen - **BUILT** (2026-09-23)
+
+**Requested, verbatim:**
+
+> fix all these and the error message below it is stuck like that fix that too.. i
+> need it working.. 20x develpoer accuracy and polish
+
+The screenshot was of the Android app's Settings screen: *Local model - could not
+start*, *Model engine - not in this build*, and a *"Reading
+Sampath_Yadav_AI_ML_Resume.pdf..."* bubble bolted to the bottom of the window.
+
+### The stuck message (a real bug, now impossible)
+
+`toast()` kept **one** shared timer: the second toast to arrive ran
+`clearTimeout(toastTimer)` before the first one's timeout had fired, so the first
+bubble was orphaned in the DOM and never removed. Adding a file produced
+`"Reading X..."` followed a second later by `"Library updated"` - and the Reading
+bubble stayed on screen for the rest of the session. Fixed by giving every bubble
+its own expiry, having each new one remove the older ones, and sweeping stragglers
+(`boot()` starts a one-second interval that removes anything past `dataset.expires`,
+which covers a page whose timers were stalled by the synchronous Android picker
+call). The upload notice is now *sticky* - deliberately outliving the five seconds,
+because a forty-megabyte PDF takes longer than that - and is removed in a `finally`,
+so it cannot survive the attempt. Verified by running the real `toast`/`removeToasts`
+from `app.js` in a live page: two in a row leave one bubble, an ordinary one clears
+itself within six seconds, a sticky one is still there after six.
+
+### The settings screen (it was saying the wrong thing)
+
+- [x] **"could not start" is gone from a build with no engine.** That state now has
+      its own headline (*no engine in this build*), its own tone, and a sentence that
+      says the engine has to be in the app when it is built - because nothing in that
+      screen can fix it. `Manager.status()` also **never publishes `state: "error"`
+      with an empty detail** any more; it fills the reason in from what is known.
+- [x] **No buttons that cannot work.** A build with no engine shows neither *Load the
+      model* nor *Test the model* (nor *Download* for a model, which would be hundreds
+      of megabytes with nothing able to run it); it shows *Check again*.
+- [x] **It names the missing piece.** When the engine is half-bundled,
+      `_engine_missing_message` prints the actual filenames (`libggml.so, ...`), which
+      is something to check, instead of "the engine is missing".
+- [x] **It says which build is installed** (`1.1.0`), so "did the new APK actually
+      install?" is answerable from the phone.
+- [x] **The one-line status** no longer says "local model problem" for a build that
+      simply has no engine; it says "quoted answers only".
+
+### The build (why an APK with no engine got installed at all)
+
+The engine is fetched during the build. The previous version caught every failure in
+`prepareAuraEngine` and carried on - so a build that lost the engine produced an APK
+that looked fine, installed fine, and could not run a model. Now:
+
+- [x] **The archive is checked**: pinned byte count and sha256, verified twice per
+      source across two sources (GitHub, plus a mirrored copy at
+      `https://user.uploads.dev/file/59e4a2b907fa4a05ddb9397c8a399c0a.gz`), so a
+      truncated download or an unreachable GitHub cannot quietly pass.
+- [x] **A missing shared object is a failure**, not a warning: half an engine is not
+      an engine.
+- [x] **The build stops** with every reason it has, unless `-PauraEngineOptional=true`
+      (or `AURA_ENGINE_OPTIONAL=1`) asks for the quoted-answers-only build.
+- [x] **The APK is opened after assembling** (`apkCarriesEngine`) and
+      `lib/arm64-v8a/libllama-server-bin.so` looked for inside it; every APK is logged
+      with its size and whether the engine is in it, and a required build fails there.
+- [x] **The engine's own size is logged** before and after stripping
+      (`AURA: the engine is 41.2 MB (was 231.6 MB)`), so a 200 MB APK explains itself.
+- [x] **The pinned release was verified against the real one**: tag `b11136` exists,
+      `llama-b11136-bin-android-arm64.tar.gz` is 72,537,038 bytes, and all fourteen
+      files `engineLibs`/`ENGINE_BUNDLE_FILES` name are inside it (they total
+      242,869,928 bytes unstripped).
+
+**Tests:** 169 passing (was 164) - including the engine-archive integrity pins, the
+APK check, an error state always carrying a reason, and a half-bundled engine naming
+its missing file. The whole suite was run against Python 3.12.7 (in a wasm
+interpreter, since this workspace has no shell), and the interface changes were
+exercised against a real DOM by evaluating the actual `app.js` functions.

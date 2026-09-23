@@ -71,23 +71,41 @@ What the build does, in order:
    `AURA_NO_PYTHON_PACKAGES=1` in the build environment and rebuild: AURA still
    reads everything, and says in the document's notes which reader it used.
 4. **The engine** — `prepareAuraEngine` downloads the pinned llama.cpp Android
-   release, unpacks it into the APK's native libraries, and strips it. See below.
-5. **Everything else** is `MainActivity.java` and three small Java files.
+   release (from GitHub, or from the mirrored copy if GitHub cannot be reached),
+   checks the pinned size and sha256, unpacks it into the APK's native libraries, and
+   strips it. If it cannot finish, **the build fails** — see below for why, and for
+   `-PauraEngineOptional=true` if you want the engine-less build on purpose.
+5. **The proof** — after assembling, the APK is opened and the engine looked for
+   inside it; the log prints each APK's size and whether it is in there.
+6. **Everything else** is `MainActivity.java` and three small Java files.
 
 ### Two traps in `app/build.gradle`
 
-* **A script-level value that a method reads has to be an `@Field`.** A Groovy build
-  script's methods cannot see a plain `def` declared at script level, and the
-  failure is not a compile error: the whole script fails to *evaluate*, with
+* **Groovy scopes a script-level value *two* opposite ways, and both ways of getting
+  it wrong are run-time surprises, not compile errors.** Each of them brought down
+  an Android build on the build server:
+
+  | written as | a **closure** can read it | a **method** can read it |
+  |---|---|---|
+  | `def x = ...` (plain) | yes | **no** |
+  | `@Field x = ...` | **no** | yes |
+
+  So `def` is for anything a closure reads, `@Field` (with
+  `import groovy.transform.Field`) for anything a method reads — and a value that
+  both need is passed to the method as a parameter. In this file `engineBinary` is a
+  `def` (the `prepareAuraEngine` closure reads it, and it is passed into
+  `stripEngine`), `supportedPython` is an `@Field` (only `detectBuildPython`
+  reads it), and **`auraLog` is an `@Field`** because the engine methods log
+  (`auraLog.lifecycle`, never a bare `logger` - a method's bare `logger` is exactly
+  the thing this rule is about). The failure messages are
 
   ```
-  A problem occurred evaluating project ':app'.
-  > Could not get unknown property 'supportedPython' for project ':app'
+  Could not get unknown property 'supportedPython' for project ':app'          # script evaluation
+  Could not get unknown property 'engineBinary' for task ':app:prepareAuraEngine'   # when the task runs
   ```
 
-  which brought down the first real Android build. `engineBinary` and
-  `supportedPython` are `@Field`s for this reason, and
-  `test_the_values_a_groovy_method_reads_are_fields` refuses to let them go back.
+  `test_script_values_reach_the_code_that_reads_them` refuses to let either slip
+  back, and asserts that no method in the engine section writes to a bare `logger`.
 * **`plugins {}` must come before any other *block*.** An `import` above it is
   fine — `import groovy.transform.Field` sits at the top of the file.
 
@@ -104,28 +122,51 @@ to execute from.
 So `prepareAuraEngine` (in `app/build.gradle`):
 
 * downloads `llama-b11136-bin-android-arm64.tar.gz` from the llama.cpp GitHub release
-  (pinned, because a phone cannot ask GitHub for the newest one at run time);
+  (pinned, because a phone cannot ask GitHub for the newest one at run time) — and, if
+  GitHub cannot be reached, from a second copy of the same archive kept at
+  `https://user.uploads.dev/file/59e4a2b907fa4a05ddb9397c8a399c0a.gz` (72,537,038 bytes,
+  the `llama-b11136` arm64 archive). **Every attempt is checked** against the pinned size
+  and sha256 written into `build.gradle`, twice per source, so a truncated download or a
+  moved mirror is retried rather than unpacked into an app that will not run;
+  `sha256sum` of the archive is `6217fb610015b2e5cc702a52c715a59d23776172c9da8056a1a43f3f524debaa`;
 * copies the launcher and its shared objects into `build/engine/jniLibs/arm64-v8a/`,
   renaming `llama-server` to **`libllama-server-bin.so`** — Android only puts files
   named `lib*.so` into the native library directory, so the name is the trick that
-  gets an executable there;
-* strips the debug information out of them. It is most of the download: the engine
-  as published is about 230 MB, about 20 MB once stripped. `stripEngine` tries
-  `llvm-strip`, `aarch64-linux-gnu-strip`, `strip`, and the NDK's `llvm-strip` in
-  turn, works on copies, and gives up quietly — an unstripped engine still runs, the
-  APK is just a lot bigger.
+  gets an executable there. All fourteen files are required: a missing shared object is
+  treated as a failed engine, not a partial one, because llama-server starting and then
+  dying on a missing `.so` is the worst thing to debug from a phone;
+* strips the debug information out of them. It is nearly all of the download: the
+  fourteen files as published total about 243 MB (the archive is 69 MB compressed),
+  and stripping takes out most of it. `stripEngine` tries `llvm-strip`,
+  `aarch64-linux-gnu-strip`, `strip`, and the NDK's `llvm-strip` in turn, works on
+  copies, never fails the build, and logs the size before and after
+  (`AURA: the engine is 41.2 MB (was 231.6 MB)`) — so the build log says what the APK
+  is carrying. With no strip tool at all, expect a very large APK;
 * sets `packaging { jniLibs { useLegacyPackaging = true } }`, which is **required**:
   it stores the native libraries uncompressed *and* extracts them on install, so
   `getApplicationInfo().nativeLibraryDir` really contains an executable file. Without
   it the directory is empty of anything you can `exec`, and the cost of having it is
   a larger APK on disk.
 
-**Nothing about the engine is fatal.** If the build machine is offline, or GitHub is
-unreachable, the APK is still produced: AURA indexes, searches and answers with
-quoted passages, and the model card says *this copy of AURA was built without the
-local model engine*. The names in `engineLibs` must stay in step with
-`ENGINE_BUNDLE_FILES` in `aura/catalog.py` — `AndroidMirrorTests` fails if they
-drift.
+### The engine is required, and the APK is proof
+
+A build that lost the engine still produces a working *quoter* — it indexes, searches
+and answers with quoted passages — and it looks exactly like a working app until
+somebody tries to load a model on the phone. That is a bad way to find out, so two
+things make it impossible to ship one by accident:
+
+* **`prepareAuraEngine` fails the build** if it cannot produce a complete engine, with
+  every reason it has (which sources it tried, what each returned, the size or sha256
+  mismatch). The engine-less build is opt-in: `-PauraEngineOptional=true`, or
+  `AURA_ENGINE_OPTIONAL=1` in the environment. There is no other way to get one;
+* **after assembling, the APK itself is opened** (`apkCarriesEngine`) and
+  `lib/arm64-v8a/libllama-server-bin.so` is looked for inside it. Every APK the build
+  produces is logged with its size and whether the engine is in it, and a required
+  build whose APK has no engine fails right there.
+
+The names in `engineLibs` must stay in step with `ENGINE_BUNDLE_FILES` in
+`aura/catalog.py` — `AndroidMirrorTests` fails if they drift, and the same suite asserts
+that the opt-in and the APK check above are still in `build.gradle`.
 
 At run time the engine needs a little help, and `aura/llama_server.py` gives it:
 `native_lib_dir` arrives from Java, `LD_LIBRARY_PATH` and `GGML_BACKEND_PATH` point
@@ -213,10 +254,13 @@ four Java files, one manifest and one icon, and every line can be read in one si
    the first place to look.
 2. **64-bit only** (`arm64-v8a`). A 32-bit phone would need a different engine build;
    add `armeabi-v7a` to `abiFilters` only if such a phone matters.
-3. The APK is big — the engine (~20 MB stripped) plus CPython and the native
-   libraries, stored uncompressed so they can be executed. Hundreds of thousands of
-   bytes of that is unavoidable; if it ever needs to shrink, the lever is dropping
-   ABI-agnostic ggml backends or splitting per-ABI APKs.
+3. The APK is big — the engine (a good deal smaller once stripped; the build log says
+   how much smaller: `AURA: the engine is 41.2 MB (was 231.6 MB)`) plus CPython and the
+   native libraries, stored uncompressed so they can be executed. If the size comes out
+   near 200 MB, no strip tool was found on the build machine and
+   `AURA: no ELF strip tool on this machine` is in the log. Hundreds of thousands of
+   bytes of the rest is unavoidable; if it ever needs to shrink again, the lever is
+   dropping ABI-agnostic ggml backends or splitting per-ABI APKs.
 4. **Nothing here has been run on a phone from inside this workspace.** The Python
    side is covered by the test suite and the mirror test, and the Gradle project is
    laid out to the letter of Chaquopy's documentation, but a first build on a real

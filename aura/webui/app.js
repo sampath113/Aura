@@ -62,6 +62,11 @@ function androidResult(raw) {
 function pickOnAndroid(kind) {
   const bridge = androidBridge();
   if (!bridge || !bridge.pick) return { error: "this build cannot show a file picker" };
+  // The bridge hands the picker's answer back in one synchronous call, which
+  // means no page code at all runs while the picker is on screen - so a bubble
+  // left over from the previous action would be stuck there for the whole
+  // time. Take it down before handing over.
+  removeToasts();
   return androidResult(bridge.pick(kind));
 }
 
@@ -104,15 +109,67 @@ async function uploadFile(file) {
   return parsed;
 }
 
-/* -------------------------------------------------------------------- toast */
-let toastTimer = null;
-function toast(message, bad) {
+/* A name short enough for one line of a toast. */
+function shortName(name) {
+  const text = String(name || "");
+  return text.length > 46 ? text.slice(0, 43) + "\u2026" : text;
+}
+
+/* Hand each chosen file to AURA, saying which one is being read.
+
+   The "Reading ..." bubble is deliberately sticky: a forty-megabyte PDF takes
+   far longer than a toast's five seconds, and a message that disappears while
+   the work is still running is worse than none. It is taken down in the
+   `finally`, so it cannot outlive the attempt whether that attempt succeeds,
+   fails, or is abandoned half way. */
+async function uploadEach(files) {
+  for (const file of files) {
+    const progress = toast("Reading " + shortName(file.name) + "\u2026", false, { sticky: true });
+    try {
+      await uploadFile(file);
+    } catch (error) {
+      toast(file.name + " - " + friendlyError(error), true);
+    } finally {
+      progress.remove();
+    }
+  }
+}
+
+/* -------------------------------------------------------------------- toast
+   One bubble at a time, and each bubble gets rid of itself.
+
+   This used to be a single shared timer: the second toast to arrive cleared the
+   first one's timeout, so the first bubble was never removed and stayed on
+   screen for ever - which is exactly how "Reading <file>..." ended up welded to
+   the bottom of the window. Every node now carries its own expiry (and the
+   sweeper below catches anything a stalled thread delayed), so a toast cannot
+   outlive its welcome no matter what else is going on.
+   --------------------------------------------------------------------------- */
+const TOAST_MS = 5200;
+
+function toast(message, bad, options) {
   const node = document.createElement("div");
   node.className = "toast" + (bad ? " bad" : "");
   node.textContent = message;
   document.body.appendChild(node);
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => node.remove(), 5200);
+  // Whatever was there is stale news the moment this one appears.
+  removeToasts(node);
+  const lifetime = options && options.sticky ? 0 : TOAST_MS;
+  if (lifetime > 0) {
+    node.dataset.expires = String(Date.now() + lifetime);
+    setTimeout(() => node.remove(), lifetime);
+  } else {
+    node.dataset.expires = "";
+  }
+  return node;
+}
+
+/* Take every bubble off the screen; `keep` spares one (the newest). */
+function removeToasts(keep) {
+  for (const node of document.querySelectorAll(".toast")) {
+    if (node !== keep) node.remove();
+  }
+  return true;
 }
 
 /* A dead engine and a rejected request both surface as "Failed to fetch",
@@ -273,9 +330,14 @@ async function loadHealth() {
   el("backendPill").className = "pill" + (/extractive/.test(backend) ? "" : " good");
   el("backendPill").title = state.model.detail || backend;
   el("backendPill").onclick = openSettings;
-  const modelBit = state.model.state === "ready" ? " - local model ready"
-    : (state.model.state === "starting" ? " - local model loading"
-      : (state.model.state === "error" ? " - local model problem" : ""));
+  // "local model problem" is the wrong sentence for a build that simply has no
+  // engine in it: nothing is broken, there is just no model to run, and the
+  // one-line status is no place to explain that - the settings screen does it.
+  const noEngine = Boolean(state.model.engine_bundled) && !state.model.engine_installed;
+  const modelBit = noEngine ? " - quoted answers only"
+    : (state.model.state === "ready" ? " - local model ready"
+      : (state.model.state === "starting" ? " - local model loading"
+        : (state.model.state === "error" ? " - local model problem" : "")));
   const where = state.host.android ? "on this phone" : (state.stats.root || "");
   // One line, shortened by CSS where there is no room for it rather than by a
   // second copy of the sentence here.
@@ -567,33 +629,60 @@ function modelSectionHtml() {
   const downloading = modelBusy();
   let html = "";
 
-  const tone = running ? "good" : (engine.state === "error" ? "bad" : "warn");
-  const headline = running ? "ready"
-    : (engine.state === "starting" ? "loading..."
-      : (engine.state === "error" ? "could not start"
-        : (selected ? "not running" : "no model chosen yet")));
+  // The engine that runs models ships inside the Android app, so a build that
+  // lost it on the way through the build machine cannot load a model at all -
+  // no setting, no button and no amount of waiting will change that. That is a
+  // different animal from "you have not chosen a model yet", and saying
+  // "could not start" about it sends the reader looking for a fault in their
+  // own setup. So it gets its own words, its own state, and no buttons that
+  // cannot possibly work.
+  const bundled = Boolean(engine.engine_bundled);
+  const engineAbsent = bundled && !engine.engine_installed;
+  const engineMissing = (eng && eng.missing) || [];
+  const engineWhy = engineMissing.length
+    ? "The model engine inside this build is incomplete - " + engineMissing.join(", ") +
+      (engineMissing.length === 1 ? " is" : " are") + " missing from the app."
+    : "This copy of AURA was installed without the model engine inside it.";
+
+  const tone = engineAbsent ? "bad" : (running ? "good" : (engine.state === "error" ? "bad" : "warn"));
+  const headline = engineAbsent ? "no engine in this build"
+    : (running ? "ready"
+      : (engine.state === "starting" ? "loading..."
+        : (engine.state === "error" ? "could not start"
+          : (selected ? "not running" : "no model chosen yet"))));
+  const detail = engineAbsent
+    ? engineWhy + " Nothing you change on this screen can fix that: the engine has to be in the app " +
+      "when it is built. Search, indexing and quoted answers all still work - only written answers " +
+      "need a model, so install a build of AURA that includes the engine." +
+      (engine.detail && engine.detail.indexOf("without the model engine") < 0
+        ? " (" + engine.detail + ")" : "")
+    : (engine.detail || "");
   html += '<div class="modelCard">' +
     '<div class="modelRow"><div class="modelName">Local model</div>' +
     '<div class="modelState ' + tone + '">' + escapeHtml(headline) + "</div></div>" +
-    '<div class="modelMeta">' + escapeHtml(engine.detail || "") + "</div>" +
+    '<div class="modelMeta">' + escapeHtml(detail) + "</div>" +
     (running ? '<div class="modelMeta">AURA writes its answers with this model, using the ' +
       "passages it found in your own documents.</div>" : "") +
     (running && engine.model_name
       ? '<div class="modelMeta">' + escapeHtml(engine.model_name + " on " + engine.url) + "</div>" : "") +
     (engine.log_tail ? '<pre class="modelLog">' + escapeHtml(engine.log_tail) + "</pre>" : "") +
     '<div class="actions">' +
-    (running ? '<button class="ghost small" data-model-action="stop">Stop the model</button>' : "") +
-    (selected && !running ? '<button class="ghost small" data-model-action="start">Load the model</button>' : "") +
-    (selected ? '<button class="ghost small" data-model-action="test"' + (downloading ? " disabled" : "") +
-      ">Test the model</button>" : "") +
+    (engineAbsent
+      // Nothing to load and nothing to test, so offer the one thing that can
+      // help: look again, in case a newer build has been installed since.
+      ? '<button class="ghost small" data-model-action="refresh">Check again</button>'
+      : (running ? '<button class="ghost small" data-model-action="stop">Stop the model</button>' : "") +
+        (selected && !running ? '<button class="ghost small" data-model-action="start">Load the model</button>' : "") +
+        (selected ? '<button class="ghost small" data-model-action="test"' + (downloading ? " disabled" : "") +
+          ">Test the model</button>" : "")) +
     "</div></div>";
 
-  const bundled = Boolean(engine.engine_bundled);
   const engineLine = bundled
     ? (engine.engine_installed
       ? "llama.cpp " + (eng.tag || "engine") + " for Android, shipped inside this app. Nothing to download."
-      : "This build of AURA was made without the model engine inside it, so it can only quote " +
-        "your sources - search, indexing and quoted answers all still work.")
+      : engineWhy + " The app still reads your documents, searches them, and answers by quoting the " +
+        "passages it matched - it just cannot write new sentences. This is a fault in the copy that " +
+        "was installed, not in your settings.")
     : (engine.engine_installed
       ? "llama.cpp " + (eng.tag || "build") + " for " + (engine.platform || "") + " " +
         (engine.arch || "") + " (" + (eng.size || "") + " in " + (eng.folder || "") + ")"
@@ -605,6 +694,15 @@ function modelSectionHtml() {
     (engine.engine_installed ? (bundled ? "built in" : "installed")
                              : (bundled ? "not in this build" : "not installed")) + "</div></div>" +
     '<div class="modelMeta">' + escapeHtml(engineLine) + "</div>" +
+    (engineAbsent
+      // Which build is on the phone decides whether the engine is there, so say
+      // it plainly: "did the new one actually install?" should be answerable
+      // from this screen.
+      ? '<div class="modelMeta">This app reports itself as build <code>' +
+        escapeHtml((engine.host || {}).app_version || "unknown") +
+        "</code>. A build made with the engine says <code>built in</code> above instead of " +
+        "<code>not in this build</code>.</div>"
+      : "") +
     (bundled ? "" :
       '<div class="actions"><button class="ghost small" data-model-action="engine"' +
       (downloading ? " disabled" : "") + ">" +
@@ -634,6 +732,11 @@ function modelSectionHtml() {
   }
 
   html += '<div class="sectionTitle">Models AURA can download</div>';
+  if (engineAbsent) {
+    html += '<div class="modelCard"><div class="modelMeta bad">Downloading one of these is wasted for ' +
+      "now: it is hundreds of megabytes, and this copy of AURA has nothing able to run it. Install a " +
+      "build that includes the model engine first.</div></div>";
+  }
   html += catalog.map((model) => {
     const ready = model.state === "ready";
     const partial = !ready && model.on_disk > 0;
@@ -651,9 +754,13 @@ function modelSectionHtml() {
       (ready
         ? '<button class="ghost small" data-model-action="use" data-path="' + escapeHtml(model.path) +
           '">Use this</button>'
-        : '<button class="primary small" data-model-action="download" data-id="' + escapeHtml(model.id) +
-          '"' + (downloading ? " disabled" : "") + ">" +
-          (partial ? "Resume the download" : "Download " + escapeHtml(model.size)) + "</button>") +
+        : (engineAbsent
+          // A model is hundreds of megabytes and there would be nothing on the
+          // phone able to run it, so the honest thing is to refuse.
+          ? '<button class="ghost small" disabled>Needs the model engine</button>'
+          : '<button class="primary small" data-model-action="download" data-id="' + escapeHtml(model.id) +
+            '"' + (downloading ? " disabled" : "") + ">" +
+            (partial ? "Resume the download" : "Download " + escapeHtml(model.size)) + "</button>")) +
       "</div></div>";
   }).join("");
 
@@ -691,7 +798,11 @@ async function handleModelAction(button) {
   button.disabled = true;
   const wait = (label) => { button.textContent = label; };
   try {
-    if (action === "download") {
+    if (action === "refresh") {
+      wait("Checking...");
+      await loadHealth();
+      await refreshModels();
+    } else if (action === "download") {
       wait("Starting...");
       await api("POST", "/api/model/download", { id: button.dataset.id });
       toast("Downloading - you can close Settings, it keeps going");
@@ -1025,10 +1136,7 @@ function wire() {
   el("pickBtn").onclick = () => el("filePicker").click();
   el("filePicker").onchange = async (event) => {
     const files = Array.from(event.target.files || []);
-    for (const file of files) {
-      try { toast("Reading " + file.name + "..."); await uploadFile(file); }
-      catch (error) { toast(file.name + " - " + friendlyError(error), true); }
-    }
+    await uploadEach(files);
     event.target.value = "";
     await loadLibrary();
     toast("Library updated");
@@ -1042,10 +1150,7 @@ function wire() {
   dropzone.addEventListener("drop", async (event) => {
     event.preventDefault();
     const files = Array.from((event.dataTransfer && event.dataTransfer.files) || []);
-    for (const file of files) {
-      try { toast("Reading " + file.name + "..."); await uploadFile(file); }
-      catch (error) { toast(file.name + " - " + friendlyError(error), true); }
-    }
+    await uploadEach(files);
     await loadLibrary();
   });
 
@@ -1077,6 +1182,17 @@ function wire() {
 
 async function boot() {
   wire();
+  // Nothing on this page should be able to leave a message up for ever. A
+  // toast's own timer does the ordinary work; this catches the cases where a
+  // long synchronous call (the Android file picker) stops timers from running
+  // on time, by which point the bubble is stale news.
+  setInterval(() => {
+    const now = Date.now();
+    for (const node of document.querySelectorAll(".toast")) {
+      const expires = Number(node.dataset.expires || 0);
+      if (expires && expires <= now) node.remove();
+    }
+  }, 1000);
   // Automatic means what the machine's own setting says, and that can change
   // while the app is open - at sunset, on a timer.
   if (window.matchMedia) {

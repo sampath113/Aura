@@ -365,9 +365,19 @@ class Manager:
     def status(self) -> dict:
         engine = self.engine_state()
         backend = self.backend() if self.state == "ready" else None
+        # A state of "error" with no sentence next to it is the worst thing this
+        # screen can show: it tells the reader something is wrong and gives them
+        # nothing to act on. There is always a true sentence to be had - the
+        # model file, or the missing engine, can always be named - so never
+        # publish an error without one.
+        detail = self.detail
+        if self.state == "error" and not detail:
+            detail = (_engine_missing_message(engine, Path(self.model_path).name)
+                      if not engine.get("installed")
+                      else "the local model stopped and did not say why")
         return {
             "state": self.state,
-            "detail": self.detail,
+            "detail": detail,
             "model_path": self.model_path,
             "model_name": Path(self.model_path).name if self.model_path else "",
             "port": self.port,
@@ -460,6 +470,14 @@ def _engine_missing_message(engine: dict, model_name: str) -> str:
     and the engine box is also where a *stale* sentence used to be shown.
     """
     if engine.get("bundled"):
+        missing = [name for name in (engine.get("missing") or [])]
+        if missing:
+            # Say which file, because "the engine is missing" is a sentence you
+            # can do nothing with, while a filename is something to check.
+            return ("this copy of AURA is missing {} from its model engine, so it cannot run {}. "
+                    "Everything else - your library, search and quoted answers - works. The app has "
+                    "to be rebuilt with the whole engine in it (see android/README.md)."
+                    .format(", ".join(missing), model_name or "a model"))
         return ("this copy of AURA was built without the local model engine, so it cannot run {}. "
                 "Everything else - your library, search and quoted answers - works. To get written "
                 "answers, rebuild the app with the engine included (see android/README.md)."
