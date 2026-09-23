@@ -161,6 +161,13 @@ button.primary.big { padding: 12px 22px; }
 }
 .toast.bad { border-color: #6b2a2a; background: #3a1c1c; }
 
+/* The screen that replaces the app once Quit AURA has stopped the server. */
+.stopped { margin: auto; max-width: 440px; padding: 40px 24px; text-align: center; }
+.stopped h1 { font-size: 21px; margin: 0 0 8px; }
+.stopped p { color: var(--muted); font-size: 13.5px; margin: 6px 0; }
+.mono, .modelMeta code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.modelMeta code { background: var(--panel2); border-radius: 5px; padding: 1px 5px; }
+
 /* ------------------------------------------------------------------- models */
 .sectionTitle {
   font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.5px;

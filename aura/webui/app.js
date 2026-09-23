@@ -7,6 +7,9 @@ const state = {
   settings: {},
   model: {},
   answers: [],
+  address: {},
+  shell: "",
+  local: true,
   busy: false,
   libraryHidden: false,
 };
@@ -171,6 +174,9 @@ async function loadHealth() {
   state.settings = health.settings || {};
   state.stats = (health.stats || {});
   state.model = health.model || {};
+  state.address = health.address || {};
+  state.shell = health.shell || "";
+  state.local = !(health.client && health.client.local === false);
   const backend = health.backend || "extractive";
   el("backendPill").textContent = backend;
   el("backendPill").className = "pill" + (/extractive/.test(backend) ? "" : " good");
@@ -550,6 +556,45 @@ const SETTING_FIELDS = [
   ["embedding_model", "Embedding model", "text"],
 ];
 
+/* The window AURA is being used in, plus the two things only the machine
+   running it can do: hand the interface to the real browser, or stop AURA. */
+const SHELL_NAMES = { webview: "native window", app: "app window", browser: "browser tab" };
+
+function windowCardHtml() {
+  const address = state.address || {};
+  const shell = state.shell || "";
+  const pocket = Boolean(window.AndroidAura && window.AndroidAura.request);
+  const label = pocket ? "AURA Pocket" : (SHELL_NAMES[shell] || "in use");
+  const phone = address.lan_allowed && address.lan_url ? address.lan_url : "";
+  let html = '<div class="modelCard">' +
+    '<div class="modelRow"><div class="modelName">This window</div>' +
+    '<div class="modelState good">' + escapeHtml(label) + "</div></div>";
+  if (address.url) {
+    html += '<div class="modelMeta">Running on ' + escapeHtml(address.url) + "</div>";
+  }
+  if (phone) {
+    html += '<div class="modelMeta">Phone (same wifi): <code>' + escapeHtml(phone) +
+      "</code> - paste it into AURA Pocket.</div>";
+  }
+  if (state.local) {
+    html += '<div class="actions">' +
+      '<button class="ghost small" id="openBrowserBtn">Open in my browser</button>' +
+      '<button class="ghost small" id="quitBtn">Quit AURA</button></div>';
+  } else {
+    html += '<div class="modelMeta">Only the machine running AURA can quit it.</div>';
+  }
+  return html + "</div>";
+}
+
+function showStopped() {
+  const app = el("app");
+  if (app) {
+    app.innerHTML = '<div class="stopped"><h1>AURA has stopped</h1>' +
+      "<p>Your library and index are safe on disk. Run AURA again to pick up where you left off.</p>" +
+      "<p>You can close this window.</p></div>";
+  }
+}
+
 function settingsFormHtml() {
   const settings = state.settings || {};
   const fields = SETTING_FIELDS.map((field) => {
@@ -565,7 +610,8 @@ function settingsFormHtml() {
       '" type="' + type + '" value="' + escapeHtml(String(value === undefined ? "" : value)) + '"></div>';
   }).join("");
   if (!fields) return '<div class="field hint">No settings could be built.</div>';
-  return '<div id="modelBox"><div class="field hint">Loading the model list...</div></div>' +
+  return windowCardHtml() +
+    '<div id="modelBox"><div class="field hint">Loading the model list...</div></div>' +
     '<details class="adv"><summary>Retrieval, model size and advanced settings</summary>' +
     '<div class="advBody">' + fields + "</div></details>" +
     '<button class="primary" id="saveSettingsBtn">Save settings</button>' +
@@ -601,8 +647,27 @@ function openSettings() {
       await loadHealth();
     } catch (error) { toast(friendlyError(error), true); }
   };
-  const reingest = el("reingestBtn");
-  if (reingest) reingest.onclick = async () => {
+  const browseBtn = el("openBrowserBtn");
+  if (browseBtn) browseBtn.onclick = async () => {
+    try {
+      const result = await api("POST", "/api/open-browser", {});
+      toast(result.opened ? "Opened in your browser" : "No default browser was found", !result.opened);
+    } catch (error) { toast(friendlyError(error), true); }
+  };
+  const quitBtn = el("quitBtn");
+  if (quitBtn) quitBtn.onclick = async () => {
+    quitBtn.disabled = true;
+    quitBtn.textContent = "Stopping...";
+    try {
+      await api("POST", "/api/quit", {});
+      showStopped();
+    } catch (error) {
+      quitBtn.disabled = false;
+      quitBtn.textContent = "Quit AURA";
+      toast(friendlyError(error), true);
+    }
+  };
+  const reingest = el("reingestBtn");  if (reingest) reingest.onclick = async () => {
     const label = reingest.textContent;
     reingest.disabled = true;
     reingest.textContent = "Re-reading...";

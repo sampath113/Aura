@@ -7,3 +7,11 @@
 pypdf>=4.2,<6            # PDF text extraction, one page at a time
 python-docx>=1.1,<2      # DOCX paragraphs and tables (brings lxml, which has wheels)
 Pillow>=10.2             # photos of notes, image metadata, screenshot ingestion
+
+# The app's own window (aura/desktop.py). pywebview wraps the webview the OS
+# already has - WebView2 on Windows, WKWebView on macOS, WebKitGTK on Linux -
+# so no GUI toolkit and no Electron-sized runtime is bundled. It is listed
+# here, and not in a separate file, so the build server installs it for the
+# freezer; AURA still runs without it (it then uses a chromeless browser
+# window). If it ever breaks a build, delete this line - nothing else changes.
+pywebview>=5.4,<7

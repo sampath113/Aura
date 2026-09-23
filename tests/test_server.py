@@ -56,7 +56,8 @@ class StubServer:
     server_version = "AURA-test"
 
 
-def request(handler_cls, method, path, body=b"", headers=None, host="127.0.0.1:8765"):
+def request(handler_cls, method, path, body=b"", headers=None, host="127.0.0.1:8765",
+            client=("127.0.0.1", 54321)):
     lines = ["{} {} HTTP/1.1".format(method, path), "Host: " + host]
     for key, value in (headers or {}).items():
         lines.append("{}: {}".format(key, value))
@@ -64,7 +65,7 @@ def request(handler_cls, method, path, body=b"", headers=None, host="127.0.0.1:8
         lines.append("Content-Length: {}".format(len(body)))
     raw = ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8") + body
     sock = FakeSocket(raw)
-    handler_cls(sock, ("127.0.0.1", 54321), StubServer())
+    handler_cls(sock, client, StubServer())
     payload = sock.out.getvalue().decode("utf-8", "replace")
     head, _, rest = payload.partition("\r\n\r\n")
     status = int(head.split(" ")[1]) if head.split(" ")[1:2] else 0
@@ -96,6 +97,12 @@ class ServerTests(unittest.TestCase):
             raw = json.dumps(payload or {}).encode("utf-8")
             headers = dict(headers or {}, **{"Content-Type": "application/json"})
         return request(self.handler_cls, "POST", path, body=raw, headers=headers)
+
+    def post_from(self, path, client, payload=None):
+        """A POST that arrives from another machine on the network."""
+        raw = json.dumps(payload or {}).encode("utf-8")
+        return request(self.handler_cls, "POST", path, body=raw,
+                       headers={"Content-Type": "application/json"}, client=client)
 
     def test_health(self):
         status, _headers, body = self.get("/health")
@@ -351,6 +358,61 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(settings["llm_n_ctx"], 8192)
         self.assertEqual(settings["llm_threads"], 2)
         self.assertEqual(settings["llm_model_path"], "")
+
+    # ------------------------------------------------ the app's own window
+    def test_health_reports_the_window_and_the_address(self):
+        self.api.address = {"url": "http://127.0.0.1:8765", "lan_url": "http://192.168.1.9:8765",
+                            "lan_allowed": True}
+        self.api.shell = "webview"
+        status, _headers, body = self.get("/health")
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        self.assertEqual(payload["shell"], "webview")
+        self.assertEqual(payload["address"]["url"], "http://127.0.0.1:8765")
+        self.assertTrue(payload["client"]["local"])
+
+    def test_a_request_from_the_network_is_not_a_local_client(self):
+        status, _headers, body = request(self.handler_cls, "GET", "/health",
+                                         client=("192.168.1.9", 5000))
+        self.assertEqual(status, 200)
+        self.assertFalse(json.loads(body)["client"]["local"])
+
+    def test_quitting_stops_the_server(self):
+        stopped = []
+        self.api.on_quit = lambda: stopped.append(True)
+        status, _headers, body = self.post("/api/quit")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["quitting"])
+        for _ in range(80):  # the hook fires just after the reply is sent
+            if stopped:
+                break
+            time.sleep(0.05)
+        self.assertTrue(stopped)
+
+    def test_another_machine_cannot_stop_aura(self):
+        stopped = []
+        self.api.on_quit = lambda: stopped.append(True)
+        status, _headers, body = self.post_from("/api/quit", ("192.168.1.9", 5000))
+        self.assertEqual(status, 403)
+        self.assertIn("only this machine", json.loads(body)["error"])
+        self.assertEqual(stopped, [])
+
+    def test_open_in_browser_is_handled_by_the_desktop_module(self):
+        self.api.address = {"url": "http://127.0.0.1:8765"}
+        opened = []
+        with mock.patch.object(server.desktop, "open_in_browser",
+                               lambda url: opened.append(url) or True):
+            status, _headers, body = self.post("/api/open-browser")
+        self.assertEqual(status, 200)
+        self.assertTrue(json.loads(body)["opened"])
+        self.assertEqual(opened, ["http://127.0.0.1:8765"])
+
+    def test_another_machine_cannot_open_a_browser_here(self):
+        with mock.patch.object(server.desktop, "open_in_browser",
+                               lambda url: self.fail("should not open anything")):
+            status, _headers, body = self.post_from("/api/open-browser", ("10.0.0.7", 4040))
+        self.assertEqual(status, 403)
+        self.assertIn("only this machine", json.loads(body)["error"])
 
 
 if __name__ == "__main__":

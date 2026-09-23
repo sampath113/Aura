@@ -12,12 +12,14 @@ import os
 import posixpath
 import socket
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, Optional
 
 from . import catalog, config
+from . import desktop
 from . import downloads
 from .jobs import Jobs
 from .llama_server import manager
@@ -39,6 +41,11 @@ class Api:
         self.engine = manager(library.root)
         self.upload_dir = Path(library.root) / "uploads"
         self.upload_dir.mkdir(parents=True, exist_ok=True)
+        # filled in by create_server once the socket is bound, and by the
+        # desktop entry point with the shell the interface is shown in
+        self.address: dict = {}
+        self.shell = ""
+        self.on_quit = None
         self._warm_up()
 
     def _warm_up(self) -> None:
@@ -65,7 +72,7 @@ class Api:
     def refresh_backend(self) -> None:
         self._backend = None
 
-    def health(self) -> dict:
+    def health(self, local: bool = True) -> dict:
         backend = self.backend
         return {
             "ok": True,
@@ -76,7 +83,34 @@ class Api:
             "backends": backend_report(self.library.settings),
             "model": self.engine.status(),
             "settings": self.library.settings,
+            "address": self.address,
+            "shell": self.shell,
+            "client": {"local": bool(local)},
         }
+
+    # ------------------------------------------------------- the app's own window
+    def quit(self) -> dict:
+        """Stop AURA (the desktop window asks for this when it is closed by hand)."""
+        hook = self.on_quit
+
+        def stop():
+            time.sleep(0.35)  # let the reply reach the window first
+            if hook is not None:
+                try:
+                    hook()
+                except Exception:  # noqa: BLE001 - quitting must not raise
+                    pass
+
+        try:
+            threading.Thread(target=stop, name="aura-quit", daemon=True).start()
+        except RuntimeError:  # no thread support (e.g. a wasm build) - do it now
+            stop()
+        return {"quitting": True}
+
+    def open_browser(self) -> dict:
+        """Open this same interface in the user's real browser."""
+        url = str((self.address or {}).get("url") or "")
+        return {"opened": bool(url) and desktop.open_in_browser(url), "url": url}
 
     def _prepare_model(self) -> str:
         """Make sure the local model is up, and say what happened.
@@ -383,6 +417,13 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             raise AuraError("that request was not valid JSON")
 
+    def _local_client(self) -> bool:
+        """Did this request come from this machine? (Only then may it quit AURA.)"""
+        try:
+            return self.client_address[0] in ("127.0.0.1", "::1", "localhost", "::ffff:127.0.0.1")
+        except Exception:  # noqa: BLE001 - no address means no privileges
+            return False
+
     # -------------------------------------------------------------------- verbs
     def do_OPTIONS(self) -> None:  # noqa: N802
         self._send_json({"ok": True})
@@ -395,7 +436,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_file(WEBUI_DIR / "index.html")
                 return
             if route == "/health" or route == "/api/health":
-                self._send_json(self.api.health())
+                self._send_json(self.api.health(local=self._local_client()))
                 return
             if route == "/api/library":
                 self._send_json(self.api.documents())
@@ -496,6 +537,18 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/engine/install":
                 self._send_json(self.api.engine_install())
                 return
+            if route in ("/api/quit", "/api/shutdown"):
+                if not self._local_client():
+                    self._send_json({"error": "only this machine can stop AURA"}, 403)
+                    return
+                self._send_json(self.api.quit())
+                return
+            if route == "/api/open-browser":
+                if not self._local_client():
+                    self._send_json({"error": "only this machine can open a browser"}, 403)
+                    return
+                self._send_json(self.api.open_browser())
+                return
             if route.startswith("/api/jobs/") and route.endswith("/cancel"):
                 job_id = route[len("/api/jobs/"):-len("/cancel")].strip("/")
                 self._send_json(self.api.job_cancel(job_id))
@@ -528,17 +581,31 @@ def lan_address() -> str:
 
 
 def create_server(library: Library, host: str = "127.0.0.1", port: int = 8765,
-                  backend=None) -> ThreadingHTTPServer:
+                  backend=None, shell: str = "") -> ThreadingHTTPServer:
     api = Api(library, backend=backend)
     handler = type("BoundHandler", (Handler,), {"api": api})
     server = ThreadingHTTPServer((host, int(port)), handler)
     server.daemon_threads = True
+    server.api = api  # so the entry point can label the window it opens
+    bound_port = server.server_address[1]
+    lan = lan_address()
+    shown_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+    api.shell = shell
+    api.address = {
+        "host": shown_host,
+        "port": bound_port,
+        "url": "http://{}:{}".format(shown_host, bound_port),
+        "lan": lan,
+        "lan_url": "http://{}:{}".format(lan, bound_port),
+        "lan_allowed": host in ("0.0.0.0",),
+    }
+    api.on_quit = server.shutdown
     return server
 
 
 def serve(library: Library, host: str = "127.0.0.1", port: int = 8765, backend=None,
-          block: bool = True) -> ThreadingHTTPServer:
-    server = create_server(library, host=host, port=port, backend=backend)
+          block: bool = True, shell: str = "") -> ThreadingHTTPServer:
+    server = create_server(library, host=host, port=port, backend=backend, shell=shell)
     if block:
         server.serve_forever()
     else:

@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import struct
 import sys
 import tempfile
 import time
@@ -17,7 +18,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aura import catalog, downloads, llama_server  # noqa: E402
+from aura import catalog, desktop, downloads, llama_server  # noqa: E402
 from aura.answer import (answer_question, build_digest, compose_closest, compose_extractive,  # noqa: E402
                          verify_answer, wants_overview)
 from aura.chunk import chunk_pages  # noqa: E402
@@ -30,6 +31,7 @@ from aura.models import AuraError, Page  # noqa: E402
 from aura.retrieve import Retriever  # noqa: E402
 from aura.store import Library  # noqa: E402
 from aura.text import keyphrases, split_sentences, stem, tokenize  # noqa: E402
+from aura_main import parse_args  # noqa: E402
 
 
 def wait_until(predicate, timeout: float = 10.0) -> bool:
@@ -904,6 +906,203 @@ class EngineTests(unittest.TestCase):
         first = llama_server.manager(self.root)
         self.assertIs(first, llama_server.manager(self.root))
         self.assertIsNot(first, Manager(self.root))
+
+
+class FakeWebview:
+    """Stands in for pywebview and records what it was asked to do."""
+
+    def __init__(self, fail_on_start: bool = False):
+        self.calls = []
+        self.fail_on_start = fail_on_start
+
+    def create_window(self, title, url, **kwargs):
+        self.calls.append(("create_window", title, url, kwargs))
+        return object()
+
+    def start(self, **kwargs):
+        self.calls.append(("start", kwargs))
+        if self.fail_on_start:
+            raise RuntimeError("pythonnet could not be loaded")
+
+
+class WindowTests(unittest.TestCase):
+    """The shell ladder in aura/desktop.py - no screen, browser or Windows here."""
+
+    URL = "http://127.0.0.1:8765"
+
+    def test_the_native_window_is_tried_first(self):
+        self.assertEqual(desktop.shell_order("auto"), ["webview", "app", "browser"])
+        self.assertEqual(desktop.shell_order(""), ["webview", "app", "browser"])
+
+    def test_a_shell_can_be_forced_or_turned_off(self):
+        self.assertEqual(desktop.shell_order("none"), [])
+        self.assertEqual(desktop.shell_order("browser"), ["browser"])
+        self.assertEqual(desktop.shell_order("app"), ["app", "browser"])
+        with self.assertRaises(desktop.ShellUnavailable):
+            desktop.shell_order("internet-explorer")
+
+    def test_the_native_window_takes_the_app_size_and_allows_text_selection(self):
+        module = FakeWebview()
+        result = desktop.open_window(self.URL, module=module, ready=True)
+        self.assertEqual(result["shell"], "webview")
+        self.assertTrue(result["blocking"], "closing a native window stops AURA")
+        kind, _title, url, kwargs = module.calls[0]
+        self.assertEqual(kind, "create_window")
+        self.assertEqual(url, self.URL)
+        self.assertEqual(kwargs["width"], desktop.WINDOW_WIDTH)
+        self.assertEqual(kwargs["min_size"], desktop.WINDOW_MIN)
+        self.assertTrue(kwargs["text_select"], "a study app must allow copying")
+        self.assertEqual(module.calls[1], ("start", {"debug": False}))
+
+    def test_the_chosen_shell_is_reported_before_the_window_blocks(self):
+        seen = []
+        desktop.open_window(self.URL, module=FakeWebview(), ready=True, on_shell=seen.append)
+        self.assertEqual(seen, ["webview"])
+
+    def test_a_broken_native_window_falls_back_to_an_app_window(self):
+        launched = []
+        module = FakeWebview(fail_on_start=True)
+        result = desktop.open_window(
+            self.URL, module=module, ready=True, spawn=launched.append,
+            platform_name="windows", environ={"ProgramFiles": r"C:\Program Files"},
+            which=lambda name: None, exists=lambda path: path.endswith("msedge.exe"))
+        self.assertEqual(result["shell"], "app")
+        self.assertFalse(result["blocking"])
+        self.assertIn("--app=" + self.URL, launched[0])
+        self.assertTrue(any(problem.startswith("webview:") for problem in result["problems"]))
+
+    def test_a_missing_webview_runtime_skips_the_native_window_entirely(self):
+        module = FakeWebview()
+        opened = []
+        result = desktop.open_window(self.URL, module=module, ready=False,
+                                     opener=opened.append, platform_name="linux",
+                                     which=lambda name: None, exists=lambda path: False)
+        self.assertEqual(result["shell"], "browser")
+        self.assertEqual(opened, [self.URL])
+        self.assertEqual(module.calls, [])
+        self.assertIn("WebView2 runtime is missing", result["problems"][0])
+
+    def test_no_browser_and_no_webview_still_reaches_the_default_browser(self):
+        opened = []
+        result = desktop.open_window(self.URL, module=None, opener=opened.append,
+                                     spawn=lambda argv: None, platform_name="linux",
+                                     which=lambda name: None, exists=lambda path: False)
+        self.assertEqual(result["shell"], "browser")
+        self.assertEqual(opened, [self.URL])
+
+    def test_no_shell_opens_nothing_at_all(self):
+        opened = []
+        result = desktop.open_window(self.URL, prefer="none", opener=opened.append)
+        self.assertEqual(result["shell"], "none")
+        self.assertEqual(opened, [])
+        self.assertIn("no window was asked for", result["detail"])
+
+    def test_edge_is_the_first_window_worth_trying_on_windows(self):
+        env = {"ProgramFiles(x86)": r"C:\Program Files (x86)",
+               "ProgramFiles": r"C:\Program Files"}
+        candidates = desktop.browser_candidates("windows", env, which=lambda name: None)
+        self.assertTrue(candidates[0].endswith("msedge.exe"))
+        self.assertTrue(candidates[1].endswith("msedge.exe"))
+        found = desktop.find_browser("windows", env, which=lambda name: None,
+                                     exists=lambda path: path.endswith("chrome.exe"))
+        self.assertTrue(found.endswith("chrome.exe"))
+
+    def test_linux_browsers_are_looked_up_on_the_path(self):
+        seen = []
+
+        def which(name):
+            seen.append(name)
+            return "/usr/bin/chromium" if name == "chromium" else None
+
+        found = desktop.find_browser("linux", {}, which=which, exists=lambda path: True)
+        self.assertEqual(found, "/usr/bin/chromium")
+        self.assertIn("google-chrome", seen)
+
+    def test_the_app_window_arguments_are_chromeless(self):
+        argv = desktop.app_argv("msedge.exe", self.URL, 1200, 800, r"C:\Users\me\.aura\browser-window")
+        self.assertEqual(argv[0], "msedge.exe")
+        self.assertIn("--app=" + self.URL, argv)
+        self.assertIn("--window-size=1200,800", argv)
+        self.assertIn(r"--user-data-dir=C:\Users\me\.aura\browser-window", argv)
+        self.assertIn("--no-first-run", argv)
+        self.assertNotIn("--new-window", argv)
+
+    def test_an_app_window_needs_no_profile_directory(self):
+        self.assertFalse(any(a.startswith("--user-data-dir")
+                             for a in desktop.app_argv("chrome", self.URL)))
+
+    def test_describe_explains_what_happened(self):
+        self.assertIn("native AURA window", desktop.describe({"shell": "webview"}))
+        line = desktop.describe({"shell": "none", "detail": "nothing worked"})
+        self.assertIn("no window", line)
+        self.assertIn("nothing worked", line)
+        skipped = desktop.describe({"shell": "app", "problems": ["webview: missing"]})
+        self.assertIn("skipped webview: missing", skipped)
+
+    def test_the_console_is_only_hidden_on_windows(self):
+        if os.name != "nt":
+            self.assertFalse(desktop.hide_console())
+            self.assertFalse(desktop.show_console())
+
+    def test_the_webview_runtime_check_is_a_windows_question(self):
+        self.assertTrue(desktop.webview_runtime_ready("linux"))
+        self.assertTrue(desktop.webview_runtime_ready("macos"))
+
+    def test_the_exe_icon_is_a_real_multi_size_ico(self):
+        path = Path(__file__).resolve().parents[1] / "aura.ico"
+        self.assertTrue(path.exists(), "aura.ico ships with the build")
+        data = path.read_bytes()
+        reserved, kind, count = struct.unpack_from("<HHH", data, 0)
+        self.assertEqual((reserved, kind), (0, 1))
+        self.assertGreaterEqual(count, 5)
+        sizes = set()
+        for index in range(count):
+            at = 6 + index * 16
+            width, height, _colours, _zero, planes, depth, size, offset = \
+                struct.unpack_from("<BBBBHHII", data, at)
+            self.assertEqual((planes, depth), (1, 32))
+            self.assertEqual(struct.unpack_from("<I", data, offset)[0], 40, "BITMAPINFOHEADER")
+            self.assertLessEqual(offset + size, len(data))
+            sizes.add(256 if width == 0 else width)
+        self.assertIn(16, sizes)
+        self.assertIn(256, sizes)
+
+    def test_the_web_ui_icon_is_served_next_to_the_ui(self):
+        icon = Path(__file__).resolve().parents[1] / "aura" / "webui" / "icon.png"
+        self.assertTrue(icon.exists())
+        self.assertEqual(icon.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+
+class EntryPointTests(unittest.TestCase):
+    """The command line the user actually types (and the build reads)."""
+
+    def test_the_window_is_what_you_get_by_default(self):
+        args = parse_args([])
+        self.assertEqual(args.shell, "auto")
+        self.assertFalse(args.console)
+        self.assertFalse(args.no_browser)
+
+    def test_a_shell_can_be_forced(self):
+        self.assertEqual(parse_args(["--shell", "app"]).shell, "app")
+        self.assertEqual(parse_args(["--shell", "browser"]).shell, "browser")
+        self.assertEqual(parse_args(["--shell", "none"]).shell, "none")
+
+    def test_the_old_no_browser_flag_still_works(self):
+        self.assertTrue(parse_args(["--no-browser"]).no_browser)
+
+
+class BuildRecipeTests(unittest.TestCase):
+    """A syntax error in the entry point or the spec only shows up on the build
+    server - several minutes and one Wine install later - so check them here."""
+
+    def test_every_python_file_and_the_spec_compile(self):
+        root = Path(__file__).resolve().parents[1]
+        sources = [p for p in sorted(root.rglob("*.py")) if "__pycache__" not in str(p)]
+        sources.append(root / "aura.spec")
+        self.assertGreaterEqual(len(sources), 15)
+        for path in sources:
+            with self.subTest(path=path.name):
+                compile(path.read_text(encoding="utf-8"), str(path), "exec")
 
 
 if __name__ == "__main__":

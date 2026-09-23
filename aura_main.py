@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """AURA desktop entry point.
 
-    AURA.exe                          start the app and open the browser
+    AURA.exe                          start the app in its own window
+    AURA.exe --shell browser           ... or in your browser instead
     AURA.exe --add notes.pdf          add documents, then start
     AURA.exe --ask "what is ATP?"     answer one question and exit
     AURA.exe --lan                    also let your phone connect (AURA Pocket)
 
-The app is a small local server plus a single-page UI, so there is no GUI
-toolkit to install and the same interface serves the desktop browser and the
-Android companion app.
+The app is a small local server plus a single-page UI, which is what lets the
+same interface serve the desktop window and the AURA Pocket Android app. On the
+desktop the UI is shown in a native window (`aura/desktop.py`), falling back to
+a chromeless browser app window and then to a browser tab, so there is still no
+GUI toolkit to install.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import threading
 import time
-import webbrowser
+import traceback
+import urllib.request
 from pathlib import Path
 
 if __package__ in (None, ""):  # running as a script / frozen exe
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aura import config           # noqa: E402
+from aura import desktop          # noqa: E402
 from aura.llama_server import backend_for, manager  # noqa: E402
 from aura.llm import detect_backend  # noqa: E402
 from aura.models import AuraError  # noqa: E402
@@ -41,7 +47,13 @@ def parse_args(argv=None):
     parser.add_argument("--port", type=int, default=0, help="port (default 8765, auto-advances if busy)")
     parser.add_argument("--lan", action="store_true",
                         help="allow other devices on your network (the AURA Pocket app) to connect")
-    parser.add_argument("--no-browser", action="store_true", help="do not open a browser window")
+    parser.add_argument("--shell", default="auto", choices=["auto", "webview", "app", "browser", "none"],
+                        help="how to show the interface: auto (native window), webview, app "
+                             "(chromeless browser window), browser, or none")
+    parser.add_argument("--console", action="store_true",
+                        help="keep the diagnostic console window visible")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="do not open any window (same as --shell none)")
     parser.add_argument("--add", action="append", default=[], metavar="PATH",
                         help="add a document to the library (repeatable)")
     parser.add_argument("--add-folder", action="append", default=[], metavar="DIR",
@@ -84,16 +96,39 @@ def banner(library: Library, host: str, port: int, allow_lan: bool) -> None:
     print("  answer engine : {}".format(engine_line(library)))
     print("  library folder: {}".format(stats["root"]))
     print()
-    print("  open this in your browser : http://{}:{}".format(
+    print("  address       : http://{}:{}".format(
         "127.0.0.1" if host in ("0.0.0.0", "") else host, port))
     if allow_lan:
-        print("  phone (same wifi)         : http://{}:{}".format(lan_address(), port))
+        print("  phone (same wifi) : http://{}:{}".format(lan_address(), port))
         print("                              paste that into AURA Pocket")
     else:
-        print("  phone access              : off (start with --lan to allow it)")
-    print()
-    print("  press Ctrl+C to stop")
+        print("  phone access  : off (start with --lan to allow it)")
+    print("  stop AURA     : the Quit button in Settings, or Ctrl+C")
     print(line)
+
+
+def aura_is_serving(port: int, timeout: float = 0.7) -> bool:
+    """True when another AURA is already answering on this machine's port.
+
+    AURA keeps serving when its window is closed, so launching the app again
+    should show that window rather than start a second copy (or fall over
+    because the port is taken).
+    """
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:{}/health".format(int(port)),
+                                    timeout=timeout) as reply:
+            payload = json.loads(reply.read().decode("utf-8", "replace"))
+        return payload.get("app") == config.APP_NAME
+    except Exception:  # noqa: BLE001 - anything else means "not ours"
+        return False
+
+
+def stop_engine(library: Library) -> None:
+    """Take the local model server down with us instead of leaving it running."""
+    try:
+        manager(library.root).stop()
+    except Exception:  # noqa: BLE001 - shutting down must never raise
+        pass
 
 
 def _human(count: int) -> str:
@@ -210,17 +245,27 @@ def main(argv=None) -> int:
                          str(library.settings.get("host") or "127.0.0.1"))
     allow_lan = bool(args.lan or host == "0.0.0.0" or library.settings.get("allow_lan"))
     port = args.port or int(library.settings.get("port") or 8765)
+    shell = "none" if args.no_browser else args.shell
+
+    if aura_is_serving(port):
+        print("AURA is already running on port {} - showing that window.".format(port))
+        url = "http://127.0.0.1:{}".format(port)
+        if shell != "none":
+            desktop.open_window(url, prefer=shell, profile_dir=library.root / "browser-window")
+        print("  (quit it from Settings, or close the native window)")
+        return 0
 
     server = None
     for attempt in range(12):
         try:
-            server = create_server(library, host=host, port=port + attempt)
+            server = create_server(library, host=host, port=port + attempt, shell=shell)
             break
         except OSError as exc:
             if attempt == 0:
                 print("port {} is busy ({})".format(port, exc))
     if server is None:
-        print("could not find a free port")
+        desktop.show_message("AURA could not start",
+                            "No free port between {} and {} could be used.".format(port, port + 11))
         return 3
     bound_port = server.server_address[1]
 
@@ -229,17 +274,56 @@ def main(argv=None) -> int:
     banner(library, host, bound_port, allow_lan)
 
     url = "http://127.0.0.1:{}".format(bound_port)
-    if not args.no_browser:
-        threading.Thread(target=lambda: (time.sleep(0.6), webbrowser.open(url)), daemon=True).start()
+    result = {"shell": shell, "blocking": False, "detail": ""}
+    console_hidden = {"value": False}
+    if shell != "none":
+        def note_shell(chosen: str) -> None:
+            server.api.shell = chosen
+            # Hide the black window *before* the native window blocks, never
+            # after: once open_window returns, the window has been closed.
+            if chosen == "webview" and not args.console:
+                console_hidden["value"] = desktop.hide_console()
+
+        result = desktop.open_window(
+            url, prefer=shell, profile_dir=library.root / "browser-window", on_shell=note_shell)
+        print("  window        : {}".format(desktop.describe(result)))
+        if result.get("shell") == "none":
+            desktop.show_message(
+                "AURA has no window",
+                "The interface is up but could not be shown ({}).\n\n"
+                "Open {}\n\nYou can also start AURA with --shell browser.".format(
+                    result.get("detail") or "unknown reason", url))
+        elif result.get("shell") == "webview":
+            print("  closing the AURA window stops AURA"
+                  + (" (console hidden - start with --console to see it)"
+                     if console_hidden["value"] else ""))
+        else:
+            if console_hidden["value"]:
+                desktop.show_console()  # the console is the way out of this mode
+            print("  AURA keeps running if you close that window - quit it from Settings")
 
     try:
         while thread.is_alive():
             time.sleep(0.4)
     except KeyboardInterrupt:
         print("\nstopping AURA ...")
-        server.shutdown()
+    stop_engine(library)
+    server.shutdown()
     return 0
 
 
+def _guarded_main(argv=None) -> int:
+    try:
+        return main(argv)
+    except KeyboardInterrupt:
+        print("\nstopping AURA ...")
+        return 0
+    except Exception:  # noqa: BLE001 - never die silently with a hidden console
+        trace = traceback.format_exc()
+        print(trace)
+        desktop.show_message("AURA stopped with an error", trace.strip()[-1200:])
+        return 1
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_guarded_main())

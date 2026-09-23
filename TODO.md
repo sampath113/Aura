@@ -97,6 +97,70 @@ install can fetch everything itself.
 
 ## 2. Smaller items
 
+## 2. The desktop window - **BUILT** (2026-09-23)
+
+**Requested, verbatim:**
+
+> instead of opening in the default brower i want the ai to open in the app
+> itself with professional gui... is that possible?
+
+Yes - and it did not need a GUI toolkit, because AURA already owns the UI. The
+window is now `aura/desktop.py`:
+
+- [x] **`webview`** - pywebview driving the OS webview (WebView2 / WKWebView /
+      WebKitGTK): a real window, 1240x820, text selection on, closing it quits
+      AURA, and the console window is hidden first (only when this process owns
+      it - `desktop.hide_console`).
+- [x] **`app`** - Edge/Chrome/Brave/Vivaldi started with `--app=` and a private
+      profile under `<data dir>/browser-window`: chromeless, no tabs, no address
+      bar. The fallback when pywebview is not installed (the shipped exe relies
+      on it until the build bundles pywebview) or WebView2 is absent.
+- [x] **`browser`** - the old default-browser behaviour, kept as the last resort.
+- [x] `--shell auto|webview|app|browser|none`, `--console`; `--no-browser` kept.
+- [x] `POST /api/quit` and `POST /api/open-browser` (loopback-only), surfaced as
+      **Quit AURA** and **Open in my browser** in Settings -> *This window*,
+      which also shows the address and the AURA Pocket URL.
+- [x] Single instance: launching AURA again opens the window of the AURA that is
+      already serving (`aura_is_serving`).
+- [x] An icon: `aura.ico` (16-256px, embedded by the spec) and
+      `aura/webui/icon.png` as the favicon / window icon.
+
+**Open:**
+
+- [ ] Remember the window size and position between runs (`webui/` cannot
+      persist it; pywebview would need to report the geometry back to the app).
+- [ ] A real installer: Start-menu shortcut, uninstaller, and a file
+      association so double-clicking an `.aura` library file opens AURA. Out of
+      scope for the build console as it stands.
+
+## 3. Queued from the user (2026-09-23, not built yet)
+
+- [ ] **Sources as a dropdown.** `sourcesHtml()` already renders a `<details>`,
+      but with the `open` attribute, so every passage is expanded. Make it start
+      closed and put the count in the summary ("Sources used by this answer (6)").
+- [ ] **Longer answers.** Two causes: (a) the model the user picked is Qwen2.5
+      **0.5B**, the weakest in the catalogue - the UI should nudge towards 1.5B+
+      when there is enough RAM; (b) `GROUNDING_SYSTEM` rule 5 tells the model to
+      answer "in 2-6 sentences". Offer a "short / full" answer-length setting
+      rather than just loosening the prompt.
+- [ ] **A misleading engine warning.** The user saw "qwen2.5-...gguf is
+      installed, but the local model engine is not. Install it from Settings."
+      as a red toast while the model was demonstrably running (the header showed
+      the model and its port, and the status line said "local model ready"), and
+      Settings now says the engine *is* installed. `Manager.ensure()` writes
+      that exact sentence, and the toast comes from a failing Settings action
+      (`handleModelAction`) whose message is
+      `Manager.test()`'s `AuraError(self.detail)` - i.e. **a stored `detail`
+      can be shown as a live error**. Two things to fix: (a) `ensure()` should
+      re-derive the reason it is returning None instead of leaving an old
+      `detail` in place, and (b) `test()`/`_prepare_model()` should never
+      surface a `detail` that the engine check does not confirm right now.
+      Worth asking the user which button produced it (Test the model is the
+      likeliest) and whether the engine had just been installed when it
+      appeared.
+
+## 4. Smaller items
+
 - [ ] Definition bias in `rank_sentences` (`aura/retrieve.py`): for "what is X"
       questions, prefer sentences where a query term is followed by
       *is / are / means / refers to*. Today a question quoted in the student's

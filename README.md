@@ -20,6 +20,7 @@ is nothing.
 | Pure-Python BM25 index | always available, instant, no model download |
 | Optional dense embeddings | semantic search when `fastembed` is installed, silently skipped otherwise |
 | A **local model you download from inside the app** | written answers instead of quoted sentences - AURA fetches the model file *and* the llama.cpp engine it runs on, so nothing has to be prepared beforehand |
+| **Its own window**, not a browser tab | `aura/desktop.py` drives the webview the OS already has (WebView2 / WKWebView / WebKitGTK); if that is unavailable it falls back to a chromeless browser app window, then to a browser tab |
 | Local web UI instead of Tkinter/Qt | no GUI toolkit to install, identical UI on desktop and phone, and it is testable headlessly |
 | Every answer validated against its evidence | a research assistant that invents references is worse than useless |
 
@@ -30,6 +31,7 @@ The pipeline is `ingest -> chunk (page-aware) -> BM25 (+dense) -> RRF + MMR -> a
 ```
 aura_main.py            desktop entry point (the build server looks for this name)
 aura.spec               PyInstaller recipe; ships aura/webui inside the executable
+aura.ico                the Windows icon (16-256px), embedded by aura.spec
 requirements.txt        the only hard dependencies (all prebuilt wheels)
 requirements-llm.txt    optional: local .gguf models
 requirements-embeddings.txt
@@ -48,6 +50,7 @@ aura/
   catalog.py            the models AURA can fetch + the llama.cpp release it needs
   downloads.py          resumable, checksum-verified downloads; archive extraction
   jobs.py               background jobs with progress, for the UI to poll
+  desktop.py            how the interface is shown: native window -> app window -> browser
   ingest.py             PDF, DOCX, text, Markdown, CSV/TSV, images
   store.py              the Library: persistence + orchestration
   server.py             local HTTP API + static UI host
@@ -77,7 +80,10 @@ build/
 ## Run it
 
 ```bash
-python aura_main.py                     # start AURA and open the browser
+python aura_main.py                     # start AURA in its own window
+python aura_main.py --shell browser     # ... or in your browser, the old way
+python aura_main.py --shell none        # just serve (for a phone-only setup)
+python aura_main.py --console           # keep the diagnostic console window
 python aura_main.py --add notes.pdf     # add a document first
 python aura_main.py --add-folder ./sem5 # ingest a whole folder
 python aura_main.py --list              # what is in the library
@@ -90,6 +96,41 @@ python aura_main.py --model C:\models\qwen2.5-1.5b-instruct-q4_k_m.gguf
 ```
 
 The library lives in `~/.aura` (override with `--data-dir` or `AURA_DATA_DIR`).
+
+## The window
+
+AURA serves a web UI, so *showing* it is a choice, and `aura/desktop.py` makes
+that choice in this order:
+
+1. **`webview` - a real window.** [pywebview](https://pywebview.flowrl.com)
+   wraps the webview the operating system already has: WebView2 on Windows,
+   WKWebView on macOS, WebKitGTK on Linux. No browser, no tabs, no address bar,
+   ~1240x820, and closing it stops AURA. On Windows the app hides its own
+   console window first (`desktop.hide_console` only touches a console this
+   process owns, so running from a terminal keeps that terminal).
+2. **`app` - an app window.** Edge/Chrome/Brave/Vivaldi started with `--app=`
+   and a private profile under `<data dir>/browser-window`: a chromeless window
+   that looks like an application. Used when pywebview is missing or its
+   runtime is not installed, which is also the case for a build where
+   `pywebview` was left out of `requirements.txt`.
+3. **`browser` - a browser tab.** The old behaviour, kept as the last resort so
+   the app can always be reached.
+
+`--shell` forces one of these (`auto` is the ladder above); `--no-browser` is
+still accepted and means `--shell none`. Whatever happens is printed in the
+banner and shown in Settings under *This window*, which is also where **Open in
+my browser** and **Quit AURA** live (both refuse to act for a client that is not
+this machine). Closing a native window quits; an app window or a browser tab
+leaves AURA serving, so `POST /api/quit` exists for that case and the console
+window stays open as the way out.
+
+Starting AURA again while it is already running does not start a second copy -
+it looks for an AURA on the port (`aura_main.aura_is_serving`) and re-opens the
+window it finds.
+
+The window icon is `aura.ico` (16-256px, embedded by `aura.spec` on Windows) and
+`aura/webui/icon.png`, which the UI links as its favicon - that is also what an
+app-mode browser window shows in the taskbar.
 
 ## Giving AURA a model
 
@@ -194,6 +235,21 @@ the model invents is stripped before you see it.
 * `aura/downloads.py` refuses a file whose byte count or sha256 does not match
   the catalogue, and deletes the `.part`, so a truncated model can never be
   loaded as if it were fine.
+* **Nothing the interface needs may be fatal to the window.** `desktop.open_window`
+  tries webview -> app window -> browser and returns which one worked; a missing
+  pywebview, a missing WebView2 runtime or a browser that will not start is a
+  line in `problems`, never an exception. Do not make the window a hard
+  requirement, and do not raise from `open_window`.
+* `desktop.py` imports `ctypes`, `winreg` and `shutil.which` **inside** the
+  functions that need them, and takes `platform_name` / `environ` / `which` /
+  `exists` / `spawn` as arguments: that is what lets the whole ladder be tested
+  headlessly (and under a wasm interpreter, which has no `ctypes`).
+* `desktop.hide_console()` must only hide a console this process owns
+  (`GetConsoleProcessList`), otherwise running `AURA.exe` from a terminal makes
+  the user's terminal disappear.
+* Quitting over HTTP (`POST /api/quit`) and opening the real browser
+  (`POST /api/open-browser`) are **loopback-only**; a phone on the same wifi may
+  ask for anything else but not those two.
 
 ## The phone client (AURA Pocket)
 
@@ -208,9 +264,18 @@ The repo is laid out for the AURA build console (`perchance.org/aura-build-conso
 and its Colab build server:
 
 * the desktop entry point is `aura_main.py` (one of the names the server probes for);
-* `requirements.txt` at the repo root is installed into the interpreter that freezes the app;
+* `requirements.txt` at the repo root is installed into the interpreter that freezes the app
+  (that is how `pywebview`, and so the native window, reaches the packager);
 * any directory holding `settings.gradle` is treated as the Android project - here `android/`;
-* `aura.spec` is picked up automatically, which is what bundles `aura/webui` into `AURA.exe`.
+* `aura.spec` is picked up automatically, which is what bundles `aura/webui` into `AURA.exe`,
+  collects pywebview and its WebView2 bindings when pywebview is installed, and embeds `aura.ico`.
+
+The spec treats pywebview as optional on purpose: `Analysis` is built from
+`hiddenimports`/`datas` that are only added when `import webview` succeeds, so a
+build on a machine without it still produces a working AURA - it just opens an
+app window instead of a native one. If a future pywebview release ever breaks the
+freeze, delete the `pywebview` line from `requirements.txt` and rebuild; nothing
+else has to change.
 
 `python -m unittest discover -s tests -t .` runs the suite.
 
