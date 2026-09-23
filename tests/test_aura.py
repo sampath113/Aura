@@ -1450,8 +1450,22 @@ class AndroidMirrorTests(unittest.TestCase):
         script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
         for name in catalog.ENGINE_BUNDLE_FILES:
             self.assertIn('"{}"'.format(name), script, name)
-        self.assertIn('def engineBinary = "{}"'.format(catalog.BUNDLED_ENGINE_BINARY), script)
+        self.assertIn('@Field String engineBinary = "{}"'.format(catalog.BUNDLED_ENGINE_BINARY),
+                      script)
         self.assertIn(catalog.ENGINE_ARCHIVE, script)
+
+    def test_the_values_a_groovy_method_reads_are_fields(self):
+        """A method in a Groovy build script cannot see a plain `def` at script
+        level - it is not a property of the script, so the reference fails with
+        "Could not get unknown property" while the script is being evaluated,
+        before a single line has been compiled and long before the Android build
+        starts. Anything at script level that a method reads must be an @Field.
+
+        This is not hypothetical: the first Android build failed exactly here."""
+        script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
+        self.assertIn("import groovy.transform.Field", script)
+        self.assertIn("@Field String engineBinary", script)
+        self.assertIn("@Field List<String> supportedPython", script)
 
     def test_the_app_is_chaquopy_python_behind_a_webview(self):
         script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")

@@ -22,6 +22,8 @@
 // copy was built without the local model engine.
 // ---------------------------------------------------------------------------
 
+import groovy.transform.Field
+
 plugins {
     id 'com.android.application'
     id 'com.chaquo.python'
@@ -42,7 +44,12 @@ def engineUrl = "https://github.com/ggml-org/llama.cpp/releases/download/${engin
 // shared objects. The launcher is the executable; Android only puts files named
 // lib*.so into the native library directory (the one place an app may execute
 // from), so it is renamed on the way in.
-def engineBinary = "libllama-server-bin.so"
+//
+// `@Field` rather than `def`, and the same goes for supportedPython below: a
+// method in a Groovy build script cannot see a plain `def` at script level. It
+// reports "Could not get unknown property" the moment the script is evaluated,
+// before a single line is compiled.
+@Field String engineBinary = "libllama-server-bin.so"
 def engineLibs = [
         "libllama-server-impl.so",
         "libllama-common.so",
@@ -71,8 +78,33 @@ def engineStamp = layout.buildDirectory.file("engine/engine.ok")
 // version as the app. Rather than hard-code a version that only matches the
 // machine it was written on, ask the machine, and let an explicit
 // `-PbuildPython=/usr/bin/python3.12` override the probe.
-def supportedPython = ["3.8", "3.9", "3.10", "3.11", "3.12", "3.13"]
+//
+// The range is what Chaquopy 16.1 builds for, less 3.8: Chaquopy still accepts
+// 3.8, but there are no Android wheels for lxml or Pillow at 3.8, so a 3.8
+// build machine would have to compile them. See the note on engineBinary above
+// for why this is an `@Field` and not a `def`.
+@Field List<String> supportedPython = ["3.9", "3.10", "3.11", "3.12", "3.13"]
 
+/** The absolute path of a command, looked up on PATH, or null. */
+String onPath(String name) {
+    if (!name) {
+        return null
+    }
+    def direct = new File(name)
+    if (direct.isAbsolute()) {
+        return (direct.isFile() && direct.canExecute()) ? direct.absolutePath : null
+    }
+    def path = System.getenv("PATH") ?: ""
+    for (String entry : path.split(File.pathSeparator)) {
+        def candidate = new File(entry, name)
+        if (candidate.isFile() && candidate.canExecute()) {
+            return candidate.absolutePath
+        }
+    }
+    return null
+}
+
+/** The version a Python reports for itself, as "major.minor", or null. */
 String pythonVersionOf(String exe) {
     try {
         def process = new ProcessBuilder(exe, "-c", "import sys; print('%d.%d' % sys.version_info[:2])")
@@ -85,20 +117,42 @@ String pythonVersionOf(String exe) {
     }
 }
 
+// The names to try, best first: a machine can have several Pythons installed,
+// and the one called `python3` is not always one Chaquopy can build for.
+List<String> pythonCandidates() {
+    return ["python3", "python3.13", "python3.12", "python3.11", "python3.10", "python3.9", "python"]
+}
+
 def detectBuildPython() {
     def override = project.findProperty("buildPython")
     if (override) {
-        def version = pythonVersionOf(override.toString())
+        def exe = onPath(override.toString()) ?: override.toString()
+        def version = pythonVersionOf(exe)
         if (version) {
-            return [override.toString(), version]
+            if (!supportedPython.contains(version)) {
+                logger.warn("AURA: -PbuildPython is Python ${version}, which Chaquopy 16.1 does not " +
+                        "build for (it knows ${supportedPython.join(', ')}) - using it anyway, because " +
+                        "you asked for it")
+            }
+            return [exe, version]
         }
         logger.warn("AURA: -PbuildPython=${override} is not a Python that runs; ignoring it")
     }
-    for (String exe : ["python3", "python"]) {
-        def version = pythonVersionOf(exe)
-        if (version && supportedPython.contains(version)) {
-            return [exe, version]
+    for (String name : pythonCandidates()) {
+        def exe = onPath(name)
+        if (exe == null) {
+            continue
         }
+        def version = pythonVersionOf(exe)
+        if (version == null) {
+            continue
+        }
+        if (!supportedPython.contains(version)) {
+            logger.lifecycle("AURA: ${exe} is Python ${version}, which Chaquopy 16.1 does not build " +
+                    "for - looking for another")
+            continue
+        }
+        return [exe, version]
     }
     return [null, null]
 }
@@ -107,11 +161,18 @@ def detectedPython = detectBuildPython()
 def buildPythonExe = detectedPython[0]
 def pythonVersion = detectedPython[1] ?: "3.11"
 if (buildPythonExe == null) {
-    logger.warn("AURA: no Python 3.8-3.13 was found on this machine, so Chaquopy will look for ${pythonVersion} itself. "
-            + "If the build complains, pass -PbuildPython=/path/to/python3.11")
+    logger.warn("AURA: no Python ${supportedPython.join('/')} was found on this machine, so Chaquopy " +
+            "will go looking for Python ${pythonVersion} itself. If the build complains about the " +
+            "Python version, pass -PbuildPython=/path/to/python3.11")
 } else {
     logger.lifecycle("AURA: building against ${buildPythonExe} (Python ${pythonVersion})")
 }
+
+// The three packages are an upgrade, not a requirement: AURA reads PDFs and
+// DOCX files with its own readers when they are absent. If a build machine
+// cannot reach the package index, set AURA_NO_PYTHON_PACKAGES=1 in the build
+// environment and the app still reads everything.
+def withPythonPackages = !(System.getenv("AURA_NO_PYTHON_PACKAGES") ?: "").trim()
 
 android {
     namespace 'org.aura.app'
@@ -176,12 +237,15 @@ chaquopy {
             // The three optional packages the desktop requirements.txt lists.
             // AURA imports each one where it is used and falls back when it is
             // absent (aura/ingest.py has a built-in PDF text scan and a DOCX
-            // reader for exactly this), so if a build machine cannot supply
-            // them, comment the line out and the app still reads everything -
-            // it just says in the document's notes which reader it used.
-            install "pypdf"
-            install "python-docx"
-            install "Pillow"
+            // reader for exactly this), so if a build machine cannot reach the
+            // package index, build with AURA_NO_PYTHON_PACKAGES=1 set and the
+            // app still reads everything - it just says in the document's notes
+            // which reader it used.
+            if (withPythonPackages) {
+                install "pypdf"
+                install "python-docx"
+                install "Pillow"
+            }
         }
     }
     sourceSets {
@@ -197,7 +261,8 @@ chaquopy {
 // ---------------------------------------------------------------------------
 List<File> stripTools() {
     def found = []
-    def onPath = { String name ->
+    // Named apart from the onPath() method above so there is no shadowing.
+    def toolOnPath = { String name ->
         def path = System.getenv("PATH") ?: ""
         for (String entry : path.split(File.pathSeparator)) {
             def candidate = new File(entry, name)
@@ -210,7 +275,7 @@ List<File> stripTools() {
     // A host strip tool handles a foreign architecture perfectly well - it only
     // rewrites the symbol and debug tables. Prefer llvm-strip, then the NDK's.
     ["llvm-strip", "aarch64-linux-gnu-strip", "strip"].each { name ->
-        def exe = onPath(name)
+        def exe = toolOnPath(name)
         if (exe != null) {
             found << exe
         }

@@ -58,17 +58,38 @@ What the build does, in order:
    explicit `abiFilters`.
 2. **A Python for the build machine.** Chaquopy's pip install and bytecode steps
    insist the build machine's Python has the same major.minor as the app's. Rather
-   than hard-code one, `app/build.gradle` probes `python3`/`python` and accepts
-   3.8–3.13 (`-PbuildPython=/usr/bin/python3.12` overrides it).
+   than hard-code one, `app/build.gradle` takes the first of `python3`, then the
+   versioned `python3.13` … `python3.9`, that reports a version in 3.9–3.13. That
+   range is what Chaquopy 16.1 builds for, less 3.8 — Chaquopy accepts 3.8, but
+   there are no Android wheels for lxml or Pillow at 3.8, so a 3.8 build machine
+   would have to compile them. `-PbuildPython=/usr/bin/python3.12` overrides the
+   probe.
 3. **The pip packages** — `pypdf`, `python-docx`, `Pillow`: the three optional
    packages `requirements.txt` lists for the desktop. Every one of them has a
    fallback inside `aura/ingest.py` (a built-in PDF text scan and a DOCX reader), so
-   if a build machine cannot supply them, comment the line out in
-   `app/build.gradle`: AURA still reads everything and says in the document's notes
-   which reader it used.
+   if the build machine cannot reach the package index, set
+   `AURA_NO_PYTHON_PACKAGES=1` in the build environment and rebuild: AURA still
+   reads everything, and says in the document's notes which reader it used.
 4. **The engine** — `prepareAuraEngine` downloads the pinned llama.cpp Android
    release, unpacks it into the APK's native libraries, and strips it. See below.
 5. **Everything else** is `MainActivity.java` and three small Java files.
+
+### Two traps in `app/build.gradle`
+
+* **A script-level value that a method reads has to be an `@Field`.** A Groovy build
+  script's methods cannot see a plain `def` declared at script level, and the
+  failure is not a compile error: the whole script fails to *evaluate*, with
+
+  ```
+  A problem occurred evaluating project ':app'.
+  > Could not get unknown property 'supportedPython' for project ':app'
+  ```
+
+  which brought down the first real Android build. `engineBinary` and
+  `supportedPython` are `@Field`s for this reason, and
+  `test_the_values_a_groovy_method_reads_are_fields` refuses to let them go back.
+* **`plugins {}` must come before any other *block*.** An `import` above it is
+  fine — `import groovy.transform.Field` sits at the top of the file.
 
 ---
 

@@ -209,10 +209,31 @@ interface, the same model list - running on the device.
       server stops when it is closed, and a leftover engine from a run Android killed
       is reaped at the next start (`_reap_orphans`, which kills only this app's own
       engine).
-- [x] **Tests** - 163 in the suite, including the Android paths, the bundled-engine
+- [x] **Tests** - 164 in the suite, including the Android paths, the bundled-engine
       report (present / half-copied / absent), the reap rules, the first-run defaults,
-      `/api/host`, the models-folder validation, the build script's engine list and
-      the mirror. See `android/README.md` for how to build it.
+      `/api/host`, the models-folder validation, the build script's engine list, the
+      `@Field` rule below, and the mirror. See `android/README.md` for how to build it.
+
+**The first build, and what it taught us (2026-09-23):** the user pushed the port to
+GitHub and ran the Android build. It failed after 47 s, before compiling anything:
+
+```
+A problem occurred evaluating project ':app'.
+> Could not get unknown property 'supportedPython' for project ':app'
+```
+
+Cause: a **method** in a Groovy build script cannot see a plain `def` declared at
+script level - it is a local of the script's `run()`, not a property. So
+`detectBuildPython()` could not read `supportedPython` (and `stripEngine()` could not
+read `engineBinary`) - `engineBinary` had not failed *yet* only because that method is
+not called until the task runs. Fixed by making both `@Field`s
+(`import groovy.transform.Field`), widening the Python probe (3.9–3.13, trying
+`python3.13` down to `python3.9`, resolving an absolute path for Chaquopy), and adding
+`AURA_NO_PYTHON_PACKAGES=1` as a documented escape hatch for the pip step.
+`test_the_values_a_groovy_method_reads_are_fields` guards the rule now. Everything
+else in the build had already checked out: AGP 8.6.1 + Chaquopy 16.1.0 resolved from
+Maven Central, and the wheel indexes list arm64 `lxml`, `Pillow` and `pypdf` for
+3.9–3.13. The second build had not been run yet at the time of writing.
 
 **Still open, and honest about it:**
 
