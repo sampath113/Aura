@@ -79,7 +79,31 @@ What the build does, in order:
    inside it; the log prints each APK's size and whether it is in there.
 6. **Everything else** is `MainActivity.java` and three small Java files.
 
-### Three traps in `app/build.gradle`
+### Four traps in `app/build.gradle`
+
+Four runs of the Android build have died in this file, each on something that is
+not a syntax error, and each of which names an innocent thing in its error. They
+are written down here because none of the fixes is obvious from the log:
+
+* **A native library has to be in an ABI directory.** Gradle reads the *name of each
+  child* of a jniLibs source directory as an ABI name, so libraries unpacked into
+  `build/engine/jniLibs/` were read as belonging to an ABI called
+  `libggml-base.so`, and nothing could be packaged (`assembleDebug`, dead 1m07s in
+  on 2026-09-23):
+
+  ```
+  * What went wrong:
+  Execution failed for task ':app:mergeDebugNativeLibs'.
+  Caused by: java.lang.IllegalStateException: out extracted from path
+  .../mergeDebugJniLibFolders/out/libggml-base.so is not an ABI
+  ```
+
+  So `engineAbi` is written once and used for both `ndk.abiFilters` and the
+  directory (`jniLibs/arm64-v8a/`); the strip step's scratch files live in
+  `build/engine/strip/` rather than in the jniLibs root, because they would be read
+  as ABI names too; and the "already unpacked" stamp checks that the ABI directory
+  really holds the fourteen files, so a stamp left over from an older layout cannot
+  quietly package nothing.
 
 * **Groovy scopes a script-level value *two* opposite ways, and both ways of getting
   it wrong are run-time surprises, not compile errors.** Each of them brought down
@@ -161,18 +185,54 @@ So `prepareAuraEngine` (in `app/build.gradle`):
   gets an executable there. All fourteen files are required: a missing shared object is
   treated as a failed engine, not a partial one, because llama-server starting and then
   dying on a missing `.so` is the worst thing to debug from a phone;
-* strips the debug information out of them. It is nearly all of the download: the
-  fourteen files as published total about 243 MB (the archive is 69 MB compressed),
-  and stripping takes out most of it. `stripEngine` tries `llvm-strip`,
-  `aarch64-linux-gnu-strip`, `strip`, and the NDK's `llvm-strip` in turn, works on
-  copies, never fails the build, and logs the size before and after
-  (`AURA: the engine is 41.2 MB (was 231.6 MB)`) — so the build log says what the APK
-  is carrying. With no strip tool at all, expect a very large APK;
+* strips the debug information out of them, with a stripper that travels with the
+  repo. The fourteen files as published total 231.6 MB, of which **216 MB is DWARF
+  and symbol tables** that no phone ever reads (`libllama-common.so` alone is 84 MB,
+  of which 75 MB is debug data); stripping takes them to **25.5 MB**. `stripEngine`
+  tries, in order, a cross-capable tool if there is one (`llvm-strip`,
+  `aarch64-linux-gnu-strip`, the NDK's `llvm-strip`), then
+  **`android/tools/strip_elf.py`** run with the same Python the build already uses,
+  and last the host's own `strip` - which is the trap this exists to avoid: on an
+  x86-64 machine it is present, it runs, and it cannot read the input at all
+  (`strip: Unable to recognise the format of the input file libllama.so`). Every
+  candidate is proved on a copy of the engine binary before it is used on
+  anything, each file goes through a copy that is only written back if it came out
+  smaller, and the sizes before and after are logged:
+
+  ```
+  AURA: stripping the engine (231.6 MB) with python3
+  AURA: the engine is 25.5 MB (was 231.6 MB; 14 of 14 files had their debug information removed)
+  ```
+
+  `strip_elf.py` copies across every byte a loader reads (everything up to the end
+  of the last `PT_LOAD` segment, verbatim) and drops only sections that are not
+  `SHF_ALLOC` and not reachable from one that is; the sections that stay keep their
+  table indices, so no `sh_link` or `sh_info` is left dangling, and the dropped
+  ones become `SHT_NULL` holes. It refuses a file that does not fit that shape (a
+  debug section inside a loadable segment, a 32-bit or big-endian file, extended
+  section numbering) rather than guessing, and it verifies its own output - the
+  loadable segments byte for byte - before replacing anything, so the worst case is
+  a bigger APK, never a broken engine. `StripElfTests` in `tests/test_aura.py`
+  covers it, including the refusals. A very large APK means no candidate could strip
+  the engine, and the log says which ones were tried;
 * sets `packaging { jniLibs { useLegacyPackaging = true } }`, which is **required**:
   it stores the native libraries uncompressed *and* extracts them on install, so
   `getApplicationInfo().nativeLibraryDir` really contains an executable file. Without
   it the directory is empty of anything you can `exec`, and the cost of having it is
   a larger APK on disk.
+
+**Two lines in a healthy build log look like problems and are not.** Gradle's own
+`stripDebugSymbols` step prints
+
+```
+Unable to strip the following libraries, packaging them as they are: libpython3.13.so, ...
+```
+
+because there is no NDK on the build machine - but the *engine* has already been
+stripped by the step above (that is where 200 MB went), and the Chaquopy libraries it
+names add up to a couple of MB, so there is nothing left worth doing about it. And
+`Deprecated Gradle features were used in this build` comes from the Android Gradle
+plugin itself, not from this file.
 
 ### The engine is required, and the APK is proof
 

@@ -124,8 +124,25 @@ def engineLibs = [
         "libggml-cpu-android_armv9.2_2.so",
 ]
 
+// The ABI the engine is built for. As far as Gradle is concerned this is not
+// only a filter, it is a *directory name*: jniLibs sources are read as
+// `jniLibs/<abi>/<library>.so`, so a native library sitting directly in a
+// jniLibs directory makes Gradle read the library's own file name as the ABI
+// and refuse the build before anything is packaged:
+//
+//     Execution failed for task ':app:mergeDebugNativeLibs'.
+//     Caused by: java.lang.IllegalStateException: out extracted from path
+//     .../out/libggml-base.so is not an ABI
+//
+// which is what a 1m07s Android build died of on 2026-09-23.
+def engineAbi = "arm64-v8a"
+
 def engineRawDir = layout.buildDirectory.dir("engine/raw")
 def engineJniDir = layout.buildDirectory.dir("engine/jniLibs")
+def engineAbiDir = layout.buildDirectory.dir("engine/jniLibs/${engineAbi}")
+// Scratch space for the strip step below, deliberately *outside* jniLibs:
+// every child of a jniLibs directory is read as an ABI name.
+def engineStripDir = layout.buildDirectory.dir("engine/strip")
 def engineStamp = layout.buildDirectory.file("engine/engine.ok")
 
 // ---------------------------------------------------------------------------
@@ -248,9 +265,11 @@ android {
 
         // The Python interpreter and the engine are both native code, and a
         // 32-bit build would need a different engine. A phone that runs a
-        // multi-gigabyte model is a 64-bit one, so that is what this builds.
+        // multi-gigabyte model is a 64-bit one, so that is what this builds -
+        // and it is the same name the engine is unpacked under, so the two
+        // cannot drift apart.
         ndk {
-            abiFilters "arm64-v8a"
+            abiFilters engineAbi
         }
     }
 
@@ -412,16 +431,31 @@ File fetchEngineArchive(def log, File rawDir, String archiveName, List<String> u
  *  there, because the failure that matters is not "the download failed" - it is
  *  "the download failed and the APK shipped anyway".
  */
-boolean apkCarriesEngine(File apk, String binaryName) {
+boolean apkCarriesEngine(File apk, String abi, String binaryName) {
+    def entry = "lib/" + abi + "/" + binaryName
     def zip = new java.util.zip.ZipFile(apk)
     try {
-        return zip.getEntry("lib/arm64-v8a/" + binaryName) != null
+        return zip.getEntry(entry) != null
     } finally {
         zip.close()
     }
 }
 
-List<File> stripTools() {
+/** Every command that might be able to strip an aarch64 ELF on this machine,
+ *  best first.
+ *
+ *  A candidate is not trusted until it has actually stripped a copy of the
+ *  engine binary, because the host's own `strip` is a trap: on an x86-64 build
+ *  machine it is present, it runs, and it cannot read the input at all -
+ *
+ *      strip: Unable to recognise the format of the input file libllama.so
+ *
+ *  - and the APK ships 231.6 MB of native libraries instead of 25.5 MB. So the
+ *  cross-capable tools come first, then the one that needs nothing installed
+ *  (the same Python the build already runs, reading tools/strip_elf.py), and
+ *  the host's strip last, where the probe below settles the question.
+ */
+List<List<String>> stripCommands(String pythonExe, File stripScript) {
     def found = []
     // Named apart from the onPath() method above so there is no shadowing.
     def toolOnPath = { String name ->
@@ -434,20 +468,19 @@ List<File> stripTools() {
         }
         return null
     }
-    // A host strip tool handles a foreign architecture perfectly well - it only
-    // rewrites the symbol and debug tables. Prefer llvm-strip, then the NDK's.
-    ["llvm-strip", "aarch64-linux-gnu-strip", "strip"].each { name ->
+    // A cross-capable strip handles a foreign architecture perfectly well - it
+    // only rewrites the symbol and debug tables - as long as it was built with
+    // that architecture's BFD. The host's `strip` was not.
+    ["llvm-strip", "aarch64-linux-gnu-strip"].each { name ->
         def exe = toolOnPath(name)
         if (exe != null) {
-            found << exe
+            found << [exe.absolutePath]
         }
     }
+    def ndkTools = []
     [System.getenv("ANDROID_NDK_HOME"), System.getenv("ANDROID_NDK_ROOT")].each { ndk ->
         if (ndk) {
-            def exe = new File(ndk, "toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip")
-            if (exe.isFile()) {
-                found << exe
-            }
+            ndkTools << new File(ndk, "toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip")
         }
     }
     def sdk = System.getenv("ANDROID_HOME") ?: System.getenv("ANDROID_SDK_ROOT")
@@ -455,24 +488,40 @@ List<File> stripTools() {
         def ndkRoot = new File(sdk, "ndk")
         if (ndkRoot.isDirectory()) {
             (ndkRoot.listFiles() ?: []).each { version ->
-                def exe = new File(version, "toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip")
-                if (exe.isFile()) {
-                    found << exe
-                }
+                ndkTools << new File(version, "toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip")
             }
         }
+    }
+    ndkTools.each { exe ->
+        if (exe.isFile()) {
+            found << [exe.absolutePath]
+        }
+    }
+    // Nothing to install and nothing to download: this one reads the file
+    // itself, and it is the only candidate on a bare build machine.
+    if (pythonExe && stripScript != null && stripScript.isFile()) {
+        found << [pythonExe, stripScript.absolutePath]
+    }
+    // Correct on a machine of the same architecture, useless on any other. It
+    // is tried anyway and its refusal is logged, which is a much better clue
+    // than silence.
+    def hostStrip = toolOnPath("strip")
+    if (hostStrip != null) {
+        found << [hostStrip.absolutePath]
     }
     return found
 }
 
-boolean tryStrip(def log, File tool, File file) {
+boolean tryStrip(def log, List<String> command, File file) {
     try {
-        def process = new ProcessBuilder(tool.absolutePath, "--strip-unneeded", file.absolutePath)
-                .redirectErrorStream(true).start()
+        def arguments = new ArrayList<String>(command)
+        arguments << "--strip-unneeded" << file.absolutePath
+        def process = new ProcessBuilder(arguments).redirectErrorStream(true).start()
         def text = process.inputStream.text
         def code = process.waitFor()
         if (code != 0) {
-            log.lifecycle("AURA: ${tool.name} could not strip ${file.name}: ${text.trim()}")
+            def reason = text.trim().replaceAll("\\s+", " ")
+            log.lifecycle("AURA: ${new File(command[0]).name} could not strip ${file.name}: ${reason}")
         }
         return code == 0 && file.length() > 0L
     } catch (Exception ignored) {
@@ -483,57 +532,66 @@ boolean tryStrip(def log, File tool, File file) {
 /** Strip the debug information out of the engine, best effort and safely.
  *
  *  It is nearly all of what the engine weighs: the fourteen files as published
- *  total about 243 MB, and stripping removes most of that - the sizes before and
- *  after are logged, so the build log says what the APK is really carrying.
- *  Nothing here is worth failing a build over (the engine runs either way, it is
- *  only bigger), so every step works on a copy and is abandoned quietly if it
- *  does not work. */
-void stripEngine(def log, File outDir, List<String> names, String binaryName) {
-    def tools = stripTools()
+ *  total 231.6 MB, of which 216 MB is DWARF and symbol tables, and stripping
+ *  takes them to 25.5 MB. The sizes before and after are logged, so the build
+ *  log says what the APK is really carrying.
+ *
+ *  Nothing here is worth failing a build over - the engine runs either way, it
+ *  is only bigger - so each file goes through a copy that is only written back
+ *  if it came out *smaller*, and a file a tool cannot handle is left exactly as
+ *  it was. (The earlier version of this deleted the original and renamed the
+ *  copy over it, so a rename that did not work took the library with it. It
+ *  never happened, and it never could again.) */
+void stripEngine(def log, File outDir, File stripDir, List<List<String>> commands,
+                 List<String> names, String binaryName) {
+    stripDir.mkdirs()
     def sizeOf = { List<String> list -> list.inject(0L) { total, name -> total + new File(outDir, name).length() } }
     long before = sizeOf(names)
-    if (tools.isEmpty()) {
-        log.warn("AURA: no ELF strip tool on this machine (looked on PATH and in every NDK) - the "
-                + "engine keeps its debug information and the APK will be about ${humanSize(before)} "
-                + "bigger than it needs to be. On a Debian-style build machine: apt-get install -y binutils")
+    def binary = new File(outDir, binaryName)
+    if (!binary.isFile()) {
+        log.warn("AURA: there is no engine binary to strip, so nothing was stripped")
         return
     }
-    def binary = new File(outDir, binaryName)
-    for (File tool : tools) {
-        if (!binary.isFile()) {
-            return
-        }
-        def probe = new File(outDir, binaryName + ".probe")
+    if (commands.isEmpty()) {
+        log.warn("AURA: no tool on this machine can strip an aarch64 ELF (looked on PATH and in every "
+                + "NDK, and there is no Python to run tools/strip_elf.py) - the engine keeps its "
+                + "debug information and the APK will be about ${humanSize(before)} bigger than it "
+                + "needs to be")
+        return
+    }
+    for (List<String> command : commands) {
+        def probe = new File(stripDir, binaryName + ".probe")
+        probe.delete()
         probe.bytes = binary.bytes
-        if (!tryStrip(log, tool, probe)) {
-            probe.delete()
+        boolean works = tryStrip(log, command, probe)
+        probe.delete()
+        if (!works) {
             continue
         }
-        probe.delete()
-        log.lifecycle("AURA: stripping the engine (${humanSize(before)}) with ${tool}")
+        log.lifecycle("AURA: stripping the engine (${humanSize(before)}) with ${new File(command[0]).name}")
+        int stripped = 0
         names.each { name ->
             def target = new File(outDir, name)
             if (!target.isFile()) {
                 return
             }
-            def copy = new File(outDir, name + ".unstripped")
-            copy.bytes = target.bytes
-            if (tryStrip(log, tool, copy)) {
-                target.delete()
-                if (!copy.renameTo(target)) {
-                    copy.delete()
-                }
-            } else {
-                copy.delete()
+            def work = new File(stripDir, name)
+            work.delete()
+            work.bytes = target.bytes
+            if (tryStrip(log, command, work) && work.length() > 0L && work.length() < target.length()) {
+                target.bytes = work.bytes
+                stripped++
             }
+            work.delete()
         }
         long after = sizeOf(names)
-        log.lifecycle("AURA: the engine is ${humanSize(after)} (was ${humanSize(before)})")
+        log.lifecycle("AURA: the engine is ${humanSize(after)} (was ${humanSize(before)}; "
+                + "${stripped} of ${names.size()} files had their debug information removed)")
         return
     }
-    log.warn("AURA: none of the strip tools on this machine could strip the engine - it keeps "
-            + "its debug information and the APK will be about ${humanSize(before)} bigger than it "
-            + "needs to be")
+    log.warn("AURA: none of the ${commands.size()} strip tools on this machine could strip an aarch64 "
+            + "ELF - the engine keeps its debug information and the APK will be about "
+            + "${humanSize(before)} bigger than it needs to be")
 }
 
 tasks.register("prepareAuraEngine") {
@@ -544,13 +602,26 @@ tasks.register("prepareAuraEngine") {
 
     doLast {
         def stamp = engineStamp.get().asFile
+        def abiDir = engineAbiDir.get().asFile
         if (stamp.isFile()) {
-            logger.lifecycle("AURA: the model engine is already unpacked")
-            return
+            // The stamp is only as good as the directory it speaks for. A
+            // stamped-but-empty engine directory is exactly what a change to
+            // the layout above leaves behind, and the next build would package
+            // nothing while reporting success.
+            def absent = ([engineBinary] + engineLibs).findAll { name ->
+                !new File(abiDir, name).isFile() || new File(abiDir, name).length() == 0L
+            }
+            if (absent.isEmpty()) {
+                logger.lifecycle("AURA: the model engine is already unpacked")
+                return
+            }
+            logger.lifecycle("AURA: the unpacked engine is incomplete (${absent.size()} file(s) missing "
+                    + "from ${engineAbi}) - unpacking it again")
+            stamp.delete()
         }
         try {
             def rawDir = engineRawDir.get().asFile
-            def outDir = engineJniDir.get().asFile
+            def outDir = abiDir
             def archive = new File(rawDir, engineArchiveName)
 
             // A copy left over from an earlier run is only reused if it is
@@ -600,15 +671,19 @@ tasks.register("prepareAuraEngine") {
                 throw new IOException("the engine archive did not contain ${missing.join(', ')}")
             }
 
-            // engineBinary is a script-level `def`, which stripEngine() - a
-            // method - cannot see, so it is handed over explicitly.
-            stripEngine(logger, outDir, new ArrayList<String>(wanted.values()), engineBinary)
+            // engineBinary and the detected Python are script-level `def`s,
+            // which stripEngine() and stripCommands() - methods - cannot see,
+            // so everything they need is handed over explicitly.
+            def stripScript = project.file("../tools/strip_elf.py")
+            def commands = stripCommands(buildPythonExe, stripScript)
+            stripEngine(logger, outDir, engineStripDir.get().asFile, commands,
+                    new ArrayList<String>(wanted.values()), engineBinary)
 
             stamp.parentFile.mkdirs()
             stamp.text = "${engineTag}\n"
             long total = wanted.values().inject(0L) { sum, name -> sum + new File(outDir, name).length() }
-            logger.lifecycle("AURA: the model engine is ready - ${wanted.size()} files, ${humanSize(total)}, "
-                    + "${engineTag}")
+            logger.lifecycle("AURA: the model engine is ready - ${wanted.size()} files in ${engineAbi}, "
+                    + "${humanSize(total)}, ${engineTag}")
         } catch (Exception error) {
             if (engineRequired) {
                 // Deliberately fatal. Shipping an APK with no engine in it looks
@@ -671,7 +746,7 @@ tasks.matching { it.name == "assembleRelease" || it.name == "assembleDebug" }.co
         }
         boolean engineMissing = false
         apks.each { apk ->
-            boolean carries = apkCarriesEngine(apk, engineBinary)
+            boolean carries = apkCarriesEngine(apk, engineAbi, engineBinary)
             logger.lifecycle("AURA: ${apk.name} - ${humanSize(apk.length())}" +
                     (carries ? " - the model engine is inside it" : " - NO MODEL ENGINE INSIDE IT"))
             if (!carries) {

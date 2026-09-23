@@ -314,6 +314,21 @@ column is not a grid at all.
   (`apkCarriesEngine`). `android/README.md` has the full reasoning; the pinned archive
   size and sha256 live in `build.gradle`, with a mirrored copy of the archive as a
   second source so a build machine that cannot reach GitHub still gets an engine.
+* **The engine has to sit in an ABI directory, and it has to be stripped.** Two
+  Android builds died in `app/build.gradle` over this. Gradle reads the *name of each
+  child directory* of a jniLibs source dir as an ABI name, so a library unpacked
+  straight into `jniLibs/` is a library for an ABI called `libggml-base.so` and
+  `mergeDebugNativeLibs` fails before anything is packaged - hence
+  `jniLibs/<engineAbi>/` (one `def engineAbi`, used for `abiFilters` too) and the
+  strip step's scratch files kept outside it. And the engine must be stripped
+  *during the build*, because it arrives with all of its debug information: 231.6 MB
+  of the 242.9 MB the llama.cpp release publishes, which becomes **25.5 MB** and a
+  28.5 MB APK instead of a 250 MB one. The build machine's own `strip` cannot do it
+  (x86-64 binutils, `Unable to recognise the format of the input file libllama.so`),
+  so `android/tools/strip_elf.py` - run by the same Python the build already uses -
+  does, copying every byte a loader reads verbatim and refusing anything it does not
+  understand. See `android/README.md`; `StripElfTests` and
+  `test_the_engine_lands_under_an_abi_directory` hold both down.
 * **A screen that says something is wrong must say what to do about it.** The model
   card prints `status()["detail"]` beside "could not start": a state of error with an
   empty detail is the one thing it must never publish, so `Manager.status()` fills the

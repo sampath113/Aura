@@ -422,3 +422,75 @@ logger is **passed to the methods as a parameter** (`stripEngine(logger, ...)`),
 from the closure, where `logger` resolves. `@Field` is now only ever a literal, and
 `test_no_script_field_initializer_reads_a_script_property` fails if one ever
 mentions `logger`, `project` or `layout` again.
+
+### The build after that one, and the two bugs it found
+
+With the configuration crash gone, `assembleDebug` got as far as packaging and died
+1m07s in - on something the log's last line does not name:
+
+```
+* What went wrong:
+Execution failed for task ':app:mergeDebugNativeLibs'.
+Caused by: java.lang.IllegalStateException: out extracted from path
+/content/aura_build/jobs/5dfb00e7ed7c/source/android/app/build/intermediates/
+merged_jni_libs/debug/mergeDebugJniLibFolders/out/libggml-base.so is not an ABI
+```
+
+**1. The engine was unpacked one directory too high.** Gradle reads the *name of
+each child directory* inside a jniLibs source directory as an ABI name. The
+libraries were being unpacked into `build/engine/jniLibs/`, so Gradle read
+`libggml-base.so` as the name of an ABI and refused to package the lot. They now go
+into `build/engine/jniLibs/arm64-v8a/`, the ABI name is written down once
+(`engineAbi`) and used for both the directory and `ndk.abiFilters`, and the strip
+step's scratch files moved to `build/engine/strip/` because they would be read as
+ABI names too. The "already unpacked" stamp now also checks that the ABI directory
+really contains the fourteen files, so a stamp left behind by the old layout cannot
+quietly package an empty engine. (`android/README.md` had documented the correct
+layout all along; the code had never done it.)
+
+**2. The engine was carrying 216 MB of debug information.** The llama.cpp release
+publishes *unstripped* binaries: the fourteen files are 231.6 MB, of which 216 MB
+is DWARF and symbol tables - `libllama-common.so` alone is 84 MB, 75 MB of it
+debug data. `useLegacyPackaging = true` stores native libraries *uncompressed*, so
+an APK would have shipped all of it. The build machine's own `strip` was no help:
+it is x86-64 binutils and cannot read an aarch64 ELF at all (`Unable to recognise
+the format of the input file libllama.so`), and installing a cross-binutils or a
+700 MB NDK to save 200 MB of APK is a bad trade.
+
+So the repo now carries its own stripper, `android/tools/strip_elf.py`, run by the
+same Python the build already uses. It works from the one fact that makes stripping
+safe: a running program (and Android's linker in particular) reads only the
+*program headers*, never the section headers. So it copies everything up to the end
+of the last `PT_LOAD` segment byte for byte, drops the sections that are not
+`SHF_ALLOC` and not reachable from one that is, moves the survivors that lived after
+the loadable part (`.shstrtab`), and rewrites the section table - keeping every
+surviving section's index and turning dropped ones into `SHT_NULL` holes, so no
+`sh_link` is left dangling. It refuses anything that does not fit that shape rather
+than guessing, and verifies its own output (the loadable segments, byte for byte)
+before replacing the file.
+
+Before it was trusted, it was checked against the *real* engine, not a fixture: all
+fourteen published libraries stripped, then re-parsed with `pyelftools` - every
+`PT_LOAD` segment byte-identical, `e_entry` and the program headers unchanged,
+`.dynsym` and both `.rela` sections still present, no `.debug*` left, no section
+running past the end of the file. It takes 231.6 MB to 25.5 MB in three seconds on
+the build machine.
+
+### The verification build
+
+Because a build had just failed, the fix was proved before asking for another push:
+the workspace was zipped and sent to the build server's `/build/upload` endpoint (no
+GitHub needed), and job `34dc2f6309c9` came back
+
+```
+AURA: stripping the engine (231.6 MB) with python3
+AURA: the engine is 25.5 MB (was 231.6 MB; 14 of 14 files had their debug information removed)
+AURA: the model engine is ready - 14 files in arm64-v8a, 25.5 MB, b11136
+AURA: app-debug.apk - 28.5 MB - the model engine is inside it
+BUILD SUCCESSFUL in 1m 16s
+```
+
+and `app-debug.apk` (29,907,952 bytes, sha256 `933481803c0c...`) was downloaded and
+opened: all fourteen libraries inside it hash **exactly** to the stripper's output,
+which is the version whose segments were checked byte for byte. 171 tests became
+179 with `StripElfTests` and the two new `build.gradle` tests, all passing.

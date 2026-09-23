@@ -1511,13 +1511,14 @@ class AndroidMirrorTests(unittest.TestCase):
         self.assertIn("@Field List<String> supportedPython", script)
         # read by the prepareAuraEngine closure -> def, and handed to the method
         self.assertIn("def engineBinary = ", script)
-        self.assertIn("void stripEngine(def log, File outDir, List<String> names, String binaryName)",
+        self.assertIn("void stripEngine(def log, File outDir, File stripDir, List<List<String>> commands,",
                       script)
-        self.assertIn("stripEngine(logger, outDir, new ArrayList<String>(wanted.values()), engineBinary)",
-                      script)
+        self.assertIn("List<String> names, String binaryName) {", script)
+        self.assertIn("stripEngine(logger, outDir, engineStripDir.get().asFile, commands,", script)
+        self.assertIn("stripCommands(buildPythonExe, stripScript)", script)
         # and the logger the methods write to arrives the same way, for the same
         # reason (a method cannot see a script-level `def`)
-        self.assertIn("boolean tryStrip(def log, File tool, File file)", script)
+        self.assertIn("boolean tryStrip(def log, List<String> command, File file)", script)
         self.assertIn("File fetchEngineArchive(def log, File rawDir, String archiveName,", script)
         self.assertIn("fetchEngineArchive(logger, rawDir, engineArchiveName, engineMirrors,", script)
         for name in ("fetchEngineArchive", "stripEngine", "tryStrip"):
@@ -1576,9 +1577,56 @@ class AndroidMirrorTests(unittest.TestCase):
         self.assertIn("auraEngineOptional", script)
         self.assertIn("AURA_ENGINE_OPTIONAL", script)
         self.assertIn("apkCarriesEngine", script)
-        self.assertIn("lib/arm64-v8a/", script)
+        self.assertIn("apkCarriesEngine(apk, engineAbi, engineBinary)", script)
         self.assertIn("NO MODEL ENGINE INSIDE IT", script)
         self.assertIn("GradleException", script)
+
+    def test_the_engine_lands_under_an_abi_directory(self):
+        """Gradle reads the *name of each directory* inside a jniLibs source dir
+        as an ABI name, so a native library sitting directly in `jniLibs/` is not
+        a library for arm64-v8a - it is a library for an ABI called
+        `libggml-base.so`, and the build stops before it packages anything:
+
+            Execution failed for task ':app:mergeDebugNativeLibs'.
+            Caused by: java.lang.IllegalStateException: out extracted from path
+            .../out/libggml-base.so is not an ABI
+
+        (A 1m07s Android build died exactly that way on 2026-09-23.) So the
+        engine is written to `jniLibs/<abi>/`, the strip step's scratch files are
+        kept well away from it - they are read as ABI names too - and the ABI
+        name itself is written down once, so the filter and the directory cannot
+        drift apart.
+        """
+        script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
+        self.assertIn('def engineAbi = "arm64-v8a"', script)
+        self.assertIn('layout.buildDirectory.dir("engine/jniLibs/${engineAbi}")', script)
+        self.assertIn("abiFilters engineAbi", script)
+        self.assertIn('def engineStripDir = layout.buildDirectory.dir("engine/strip")', script)
+        # the libraries go into the ABI directory, and nothing writes one
+        # straight into the jniLibs root
+        self.assertIn("def outDir = abiDir", script)
+        self.assertNotIn("outDir = engineJniDir.get().asFile", script)
+        self.assertIn("stripDir.mkdirs()", script)
+        # and the check on the finished APK looks where the engine actually is
+        self.assertIn('"lib/" + abi + "/" + binaryName', script)
+
+    def test_the_build_strips_the_engine_with_a_tool_that_travels_with_it(self):
+        """The engine arrives unstripped: 231.6 MB of libraries, 216 MB of which
+        is debug information. On the build machine's own `strip` it stays that
+        way - `Unable to recognise the format of the input file` - so a stripper
+        that needs nothing installed (tools/strip_elf.py, run by the same Python
+        the build already uses) has to be in the repo and be tried *before* the
+        host's, which exists everywhere and works almost nowhere."""
+        script = (self.android / "app" / "build.gradle").read_text(encoding="utf-8")
+        self.assertTrue((self.android / "tools" / "strip_elf.py").is_file())
+        self.assertIn('project.file("../tools/strip_elf.py")', script)
+        self.assertIn("[pythonExe, stripScript.absolutePath]", script)
+        self.assertLess(script.index("found << [pythonExe, stripScript.absolutePath]"),
+                        script.index('toolOnPath("strip")'))
+        # a file a tool cannot shrink is never written back, and the probe is the
+        # only thing that decides which tool is used
+        self.assertIn("work.length() < target.length()", script)
+        self.assertIn("probe.bytes = binary.bytes", script)
 
     def test_the_engine_archive_is_fetched_whole_or_not_at_all(self):
         """A truncated download or a mirror that has moved would otherwise be
@@ -1622,6 +1670,177 @@ class AndroidMirrorTests(unittest.TestCase):
         for name in ("MainActivity.java", "Host.java", "Pickers.java"):
             self.assertTrue((java / "app" / name).is_file(), name)
         self.assertFalse((self.android / "app" / "src" / "main" / "assets" / "index.html").exists())
+
+
+ANDROID_TOOLS = Path(__file__).resolve().parents[1] / "android" / "tools"
+
+
+def load_strip_elf():
+    """android/tools/strip_elf.py, loaded by path - it is a build tool that the
+    Android build runs, not part of the aura package."""
+    existing = sys.modules.get("strip_elf")
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location("strip_elf", ANDROID_TOOLS / "strip_elf.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["strip_elf"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def synthetic_so(debug_inside_segment=False):
+    """A small but complete aarch64 ELF64 shared object.
+
+    One PT_LOAD covers the ELF header, the program headers and .text. After the
+    loadable part come `.shstrtab` (which has to survive), and `.debug_info`,
+    `.symtab` and `.strtab` (which do not). With `debug_inside_segment` the
+    debug section sits *inside* the segment instead - the shape the stripper has
+    to refuse, because those bytes cannot go without moving the segment that
+    maps them.
+    """
+    names = b"\0"
+    index = {}
+    for name in (".text", ".shstrtab", ".debug_info", ".symtab", ".strtab"):
+        index[name] = len(names)
+        names += name.encode() + b"\0"
+
+    text_offset, text_size = 0x80, 0x10
+    prefix_end = 0xC0                       # the one PT_LOAD covers [0, 0xC0)
+    shstrtab_offset = prefix_end
+    cursor = shstrtab_offset + len(names)
+    if debug_inside_segment:
+        debug_offset, debug_size = 0x90, 0x10
+    else:
+        debug_offset, debug_size = cursor, 0x30
+        cursor += debug_size
+    symtab_offset = (cursor + 7) // 8 * 8
+    strtab_offset = symtab_offset + 0x20
+    shoff = (strtab_offset + 0x10 + 7) // 8 * 8
+    shnum = 6
+    buffer = bytearray(max(shoff + shnum * 64, 4096))
+
+    sections = (
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (index[".text"], 1, 0x6, text_offset, text_offset, text_size, 0, 0, 16, 0),
+        (index[".shstrtab"], 3, 0, 0, shstrtab_offset, len(names), 0, 0, 1, 0),
+        (index[".debug_info"], 1, 0, 0, debug_offset, debug_size, 0, 0, 1, 0),
+        (index[".symtab"], 2, 0, 0, symtab_offset, 0x20, 5, 1, 8, 24),
+        (index[".strtab"], 3, 0, 0, strtab_offset, 0x10, 0, 0, 1, 0),
+    )
+    ident = b"\x7fELF\x02\x01\x01" + b"\0" * 9
+    struct.pack_into("<16sHHIQQQIHHHHHH", buffer, 0, ident, 3, 0xB7, 1, text_offset,
+                     64, shoff, 0, 64, 56, 1, 64, shnum, 2)
+    struct.pack_into("<IIQQQQQQ", buffer, 64, 1, 5, 0, 0, 0, prefix_end, prefix_end, 0x1000)
+    buffer[text_offset:text_offset + text_size] = bytes(range(text_size))
+    buffer[shstrtab_offset:shstrtab_offset + len(names)] = names
+    for position, section in enumerate(sections):
+        struct.pack_into("<IIQQQQIIQQ", buffer, shoff + position * 64, *section)
+    return bytes(buffer)
+
+
+class StripElfTests(unittest.TestCase):
+    """`android/tools/strip_elf.py` - the tool that takes the bundled engine from
+    231.6 MB to 25.5 MB on a build machine whose own `strip` cannot read an
+    aarch64 ELF.
+
+    It rewrites an ELF by hand, which is exactly the kind of code that needs
+    tests saying *why* it is safe: every byte a loader reads has to come out
+    identical, and anything the tool does not understand has to be refused
+    rather than guessed at.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp.name)
+        self.strip = load_strip_elf()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def write(self, data, name="libtest.so"):
+        path = self.base / name
+        path.write_bytes(data)
+        return path
+
+    def assert_segments_unchanged(self, original, after):
+        """Everything the loader maps, byte for byte - with one exception,
+        `e_shoff`, which records where the section header table is. The table
+        moved, that field is inside the first PT_LOAD, and no loader reads it."""
+        before = self.strip.Elf(original)
+        new_shoff = struct.unpack_from("<Q", after, 0x28)[0]
+        for segment in before.loads:
+            start, end = segment.offset, segment.offset + segment.filesz
+            wanted = bytearray(original[start:end])
+            field = 0x28 - start
+            if 0 <= field and field + 8 <= len(wanted):
+                struct.pack_into("<Q", wanted, field, new_shoff)
+            self.assertEqual(after[start:end], bytes(wanted))
+
+    def test_debug_information_goes_and_the_loader_sees_the_same_file(self):
+        original = synthetic_so()
+        path = self.write(original)
+        old, new, dropped = self.strip.strip_file(str(path))
+        after = path.read_bytes()
+
+        self.assertEqual(old, len(original))
+        self.assertLess(new, old)
+        self.assertEqual(sorted(
+            name for index, name in enumerate(self.strip.Elf(original).names)
+            if name in (".debug_info", ".symtab", ".strtab")), [".debug_info", ".strtab", ".symtab"])
+        self.assertEqual(dropped, 3)
+        self.assert_segments_unchanged(original, after)
+
+        stripped = self.strip.Elf(after)
+        alive = [name for index, name in enumerate(stripped.names)
+                 if stripped.sections[index].type != 0]
+        self.assertNotIn(".debug_info", alive)
+        self.assertNotIn(".symtab", alive)
+        self.assertIn(".text", alive)
+        self.assertIn(".shstrtab", alive)
+        # the tables that describe the loadable parts are intact...
+        self.assertEqual(stripped.entry, self.strip.Elf(original).entry)
+        self.assertEqual([segment.filesz for segment in stripped.loads],
+                         [segment.filesz for segment in self.strip.Elf(original).loads])
+        # ...the section table moved to the end, where the header now says it is
+        self.assertEqual(struct.unpack_from("<Q", after, 0x28)[0], new - 6 * 64)
+        self.assertEqual(len(stripped.sections), 6)
+
+    def test_a_debug_section_inside_a_loadable_segment_is_refused(self):
+        """Those bytes cannot be dropped without moving the segment that maps
+        them, and moving a segment means choosing new virtual addresses - a job
+        for a linker, not for this. Refusing leaves the file exactly as it was,
+        which is a bigger APK, not a broken engine."""
+        original = synthetic_so(debug_inside_segment=True)
+        path = self.write(original)
+        with self.assertRaises(self.strip.Unsupported):
+            self.strip.strip_file(str(path))
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_stripping_twice_is_not_an_error_and_changes_nothing(self):
+        path = self.write(synthetic_so())
+        self.assertEqual(self.strip.main(["--strip-unneeded", str(path)]), 0)
+        once = path.read_bytes()
+        self.assertEqual(self.strip.main(["--strip-unneeded", str(path)]), 0)
+        self.assertEqual(path.read_bytes(), once)
+
+    def test_a_file_that_is_not_an_elf_is_reported_and_left_alone(self):
+        path = self.write(b"not an elf at all", "notes.txt")
+        self.assertEqual(self.strip.main(["--strip-unneeded", str(path)]), 3)
+        self.assertEqual(path.read_bytes(), b"not an elf at all")
+
+    def test_a_32_bit_elf_is_refused_rather_than_read_wrong(self):
+        data = bytearray(synthetic_so())
+        data[4] = 1                                     # ELFCLASS32
+        path = self.write(bytes(data))
+        self.assertEqual(self.strip.main([str(path)]), 3)
+        self.assertEqual(path.read_bytes(), bytes(data))
+
+    def test_a_section_header_table_past_the_end_is_refused(self):
+        data = bytearray(synthetic_so())
+        struct.pack_into("<Q", data, 0x28, len(data) - 16)
+        path = self.write(bytes(data))
+        self.assertEqual(self.strip.main([str(path)]), 3)
+        self.assertEqual(path.read_bytes(), bytes(data))
 
 
 class BuildRecipeTests(unittest.TestCase):
